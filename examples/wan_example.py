@@ -20,6 +20,7 @@ from xfuser.core.distributed import (
     initialize_runtime_state,
     is_dp_last_group,
 )
+import xfuser.model_executor.models.transformers.transformer_wan # Registers the xFuser wrappers for the Wan transformer
 
 TASK_FPS = {
     "i2v": 16,

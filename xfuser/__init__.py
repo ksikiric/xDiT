@@ -28,9 +28,9 @@ __all__ = [
     "xFuserStableDiffusionXLPipeline",
     "xFuserSanaPipeline",
     "xFuserSanaSprintPipeline",
+    "xFuserWanPipeline",
+    "xFuserWanImageToVideoPipeline",
     "xFuserArgs",
     "EngineConfig",
     "xDiTParallel",
-    "xFuserWanPipeline",
-    "xFuserWanImageToVideoPipeline",
 ]
