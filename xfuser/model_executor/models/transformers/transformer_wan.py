@@ -67,7 +67,6 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             and get_sequence_parallel_world_size() > 1
         )
         set_hybrid_seq_parallel_attn(self, self.use_long_ctx_attn_kvcache)
-        self.use_fp8_attn = False
 
     def _get_qkv_projections(self, attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
         # encoder_hidden_states is only passed for cross-attention
@@ -95,6 +94,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = attn.add_k_proj(encoder_hidden_states_img)
             value_img = attn.add_v_proj(encoder_hidden_states_img)
         return key_img, value_img
+
 
     def __call__(
         self,
