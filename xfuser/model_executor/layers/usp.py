@@ -22,6 +22,7 @@ from xfuser.core.distributed import (
 from packaging.version import parse
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.core.distributed import get_runtime_state
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_FLASH_ATTN = env_info["has_flash_attn"]
 if HAS_FLASH_ATTN:
@@ -249,10 +250,7 @@ def _attention(query, key, value, dropout_p, is_causal, use_fp8_attn=False):
     """
     if HAS_AITER:
         if use_fp8_attn:
-            try:
-                output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
-            except Exception as e:
-                raise RuntimeError("FP8 attention failed") from e
+            output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
         else:
             output, _ = _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal)
         return output
@@ -331,12 +329,12 @@ def USP(
         joint_value: torch.Tensor | None = None,
         joint_strategy: str | None = None,
         attn_layer=None,
-        use_fp8_attn: bool = False,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
     Ring attention. Also supports joint tensors and key-value caching for pipeline parallelism.
     """
+    use_fp8_attn = get_runtime_state().get_fp8_attn_flag()
 
     if joint_strategy:
         query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)

@@ -94,8 +94,7 @@ def main():
         optional_kwargs = {}
         if image:
             optional_kwargs["image"] = image
-        attn_kwargs = {'use_fp8_attn': engine_config.runtime_config.use_fp8_attn,
-                       'use_hybrid_fp8_attn': engine_config.runtime_config.use_hybrid_fp8_attn}
+        attn_kwargs = {'use_hybrid_fp8_attn': engine_config.runtime_config.use_hybrid_fp8_attn}
         output = pipe(
             height=height,
             width=width,

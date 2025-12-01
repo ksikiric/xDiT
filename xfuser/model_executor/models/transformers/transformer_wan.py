@@ -96,9 +96,6 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             value_img = attn.add_v_proj(encoder_hidden_states_img)
         return key_img, value_img
 
-    def _set_fp8_attn(self, use_fp8_attn: bool):
-        self.use_fp8_attn = use_fp8_attn
-
     def __call__(
         self,
         attn: "WanAttention",
@@ -151,11 +148,11 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
 
-            hidden_states_img = USP(query.transpose(1, 2), key_img.transpose(1, 2), value_img.transpose(1, 2), use_fp8_attn=self.use_fp8_attn).transpose(1, 2)
+            hidden_states_img = USP(query.transpose(1, 2), key_img.transpose(1, 2), value_img.transpose(1, 2)).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
-        hidden_states = USP(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), use_fp8_attn=self.use_fp8_attn).transpose(1, 2)
+        hidden_states = USP(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)).transpose(1, 2)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -191,10 +188,8 @@ class xFuserWanTransformer3DModel(xFuserTransformerBaseWrapper):
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
-            fp8_enabled = attention_kwargs.pop("use_fp8_attn", False)
         else:
             lora_scale = 1.0
-            fp8_enabled = False
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -270,15 +265,11 @@ class xFuserWanTransformer3DModel(xFuserTransformerBaseWrapper):
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
-                block.attn1.processor._set_fp8_attn(fp8_enabled)
-                block.attn2.processor._set_fp8_attn(fp8_enabled)
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
         else:
             for block in self.blocks:
-                block.attn1.processor._set_fp8_attn(fp8_enabled)
-                block.attn2.processor._set_fp8_attn(fp8_enabled)
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # 5. Output norm, projection & unpatchify
