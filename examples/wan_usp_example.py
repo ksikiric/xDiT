@@ -71,6 +71,9 @@ def parallelize_transformer(pipe):
         else:
             lora_scale = 1.0
 
+        runtime = get_runtime_state()
+        runtime.increment_step_counter()
+
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -255,6 +258,15 @@ def main():
             if is_dp_last_group():
                 print(f"Adjusting height and width to be multiples of {mod_value}. New dimensions: {height}x{width}")
         image = None
+
+    if engine_config.runtime_config.use_hybrid_fp8_attn:
+        guidance_scale = input_config.guidance_scale
+        fp8_steps_threshold = 3*2 if guidance_scale > 1.0 else 3
+        total_steps = input_config.num_inference_steps*2 if guidance_scale > 1.0 else input_config.num_inference_steps
+        fp8_decision_vector = torch.tensor(
+        [i >= fp8_steps_threshold and i < (total_steps - fp8_steps_threshold)
+            for i in range(total_steps)], dtype=torch.bool)
+        get_runtime_state().set_hybrid_attn_parameters(fp8_decision_vector)
 
     def run_pipe(input_config, image):
         torch.cuda.reset_peak_memory_stats()

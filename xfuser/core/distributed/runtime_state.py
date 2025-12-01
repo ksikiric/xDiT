@@ -165,6 +165,19 @@ class DiTRuntimeState(RuntimeState):
             except ImportError:
                 raise RuntimeError("aiter fp8 flash attention is not available")
 
+    def increment_step_counter(self):
+        if self.use_hybrid_fp8_attn:
+            self.runtime_config.use_fp8_attn = self.fp8_decision_vector[self.step_counter]
+            self.step_counter += 1
+            if self.step_counter >= self.total_steps:
+                self.step_counter = 0
+
+    def set_hybrid_attn_parameters(self, fp8_decision_vector: torch.Tensor):
+        self.fp8_decision_vector = fp8_decision_vector
+        self.total_steps = len(fp8_decision_vector)
+        self.step_counter = 0
+        self.use_hybrid_fp8_attn = True
+
     def set_input_parameters(
         self,
         height: Optional[int] = None,
@@ -194,12 +207,6 @@ class DiTRuntimeState(RuntimeState):
             self._input_size_change(height, width, batch_size)
 
         self.ready = True
-
-    def set_fp8_attn_flag(self, use_fp8_attn: bool):
-        self.runtime_config.use_fp8_attn = use_fp8_attn
-    
-    def get_fp8_attn_flag(self):
-        return self.runtime_config.use_fp8_attn
 
     def set_video_input_parameters(
         self,
