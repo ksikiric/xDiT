@@ -158,6 +158,13 @@ class DiTRuntimeState(RuntimeState):
                 * pipeline.transformer.config.attention_head_dim,
             )
 
+        if (self.runtime_config.use_fp8_attn or self.runtime_config.use_hybrid_fp8_attn) and envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
+            # TODO: Same check but for flash attention.
+            try:
+                from aiter import flash_attn_fp8_pertensor_func
+            except ImportError:
+                raise RuntimeError("aiter fp8 flash attention is not available")
+
     def set_input_parameters(
         self,
         height: Optional[int] = None,
@@ -189,12 +196,6 @@ class DiTRuntimeState(RuntimeState):
         self.ready = True
 
     def set_fp8_attn_flag(self, use_fp8_attn: bool):
-        # TODO: Same check but for flash attention.
-        if use_fp8_attn and envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
-            try:
-                from aiter import flash_attn_fp8_pertensor_func
-            except ImportError:
-                raise RuntimeError("aiter fp8 flash attention is not available")
         self.runtime_config.use_fp8_attn = use_fp8_attn
     
     def get_fp8_attn_flag(self):
