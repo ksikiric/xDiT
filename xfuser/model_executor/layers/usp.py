@@ -334,7 +334,7 @@ def USP(
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
     Ring attention. Also supports joint tensors and key-value caching for pipeline parallelism.
     """
-    use_fp8_attn = get_runtime_state().get_fp8_attn_flag()
+    use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
 
     if joint_strategy:
         query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)

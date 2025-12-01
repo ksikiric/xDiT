@@ -309,10 +309,9 @@ class xFuserWanImageToVideoPipeline(xFuserPipelineBaseWrapper):
             boundary_timestep = None
 
         #! ---------------------------------------- MODIFIED BELOW ----------------------------------------
-        hybrid_attention = self.attention_kwargs.get("use_hybrid_fp8_attn", None)
+        hybrid_attention = self.engine_config.runtime_config.use_hybrid_fp8_attn
 
         if hybrid_attention:
-            runtime = get_runtime_state()
             # TODO: Remove magic numbers
             use_fp8_flash_attn = torch.tensor([i >= 3 and i < (len(timesteps) - 3) for i in range(len(timesteps))], dtype=torch.bool)
 
@@ -321,7 +320,7 @@ class xFuserWanImageToVideoPipeline(xFuserPipelineBaseWrapper):
                 if self.interrupt:
                     continue
                 if hybrid_attention:
-                    runtime.set_fp8_attn_flag(use_fp8_flash_attn[i].item())
+                    self.engine_config.runtime_config.use_fp8_attn = use_fp8_flash_attn[i].item()
         #! ---------------------------------------- MODIFIED ABOVE ----------------------------------------
 
                 self._current_timestep = t

@@ -157,7 +157,7 @@ class DiTRuntimeState(RuntimeState):
                 backbone_inner_dim=pipeline.transformer.config.num_attention_heads
                 * pipeline.transformer.config.attention_head_dim,
             )
-
+        self.use_hybrid_fp8_attn = False
         if (self.runtime_config.use_fp8_attn or self.runtime_config.use_hybrid_fp8_attn) and envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
             # TODO: Same check but for flash attention.
             try:

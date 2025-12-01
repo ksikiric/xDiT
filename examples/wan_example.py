@@ -94,7 +94,6 @@ def main():
         optional_kwargs = {}
         if image:
             optional_kwargs["image"] = image
-        attn_kwargs = {'use_hybrid_fp8_attn': engine_config.runtime_config.use_hybrid_fp8_attn}
         output = pipe(
             height=height,
             width=width,
@@ -103,7 +102,6 @@ def main():
             num_frames=input_config.num_frames,
             guidance_scale=input_config.guidance_scale,
             generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
-            attention_kwargs=attn_kwargs,
             **optional_kwargs,
         ).frames[0]
         end = time.perf_counter()
