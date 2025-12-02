@@ -51,21 +51,11 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
             "dropout_p": dropout_p,
             "is_causal": is_causal,
         }
-        if HAS_AITER:
+        if HAS_AITER or HAS_FLASH_ATTN:
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
                 1,
-                _aiter_attn_call,
-                query,
-                key,
-                value,
-                **kwargs,
-            )
-        elif HAS_FLASH_ATTN:
-            out, *_ = _templated_ring_attention(
-                PROCESS_GROUP.RING_PG,
-                1,
-                _flash_attn_call,
+                _attention,
                 query,
                 key,
                 value,
@@ -95,7 +85,7 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
                 1,
-                _aiter_attn_call,
+                _attention,
                 query,
                 key,
                 value,
@@ -104,7 +94,7 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
         elif HAS_FLASH_ATTN:
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
-                _flash_attn_call,
+                _attention,
                 query,
                 key,
                 value,
@@ -244,10 +234,11 @@ def _flash_attn_call(query, key, value, dropout_p, is_causal):
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
 
-def _attention(query, key, value, dropout_p, is_causal, use_fp8_attn=False):
+def _attention(query, key, value, dropout_p, is_causal):
     """
     Calls the correct attention mechanism based on the available libraries
     """
+    use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
     if HAS_AITER:
         if use_fp8_attn:
             output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
@@ -334,7 +325,6 @@ def USP(
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
     Ring attention. Also supports joint tensors and key-value caching for pipeline parallelism.
     """
-    use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
 
     if joint_strategy:
         query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)
@@ -352,14 +342,14 @@ def USP(
         value = _concat_joint_tensor(value, joint_value, joint_strategy, dim=2)
 
     if get_sequence_parallel_world_size() == 1: # No SP
-        out = _attention(query, key, value, dropout_p=dropout_p, is_causal=is_causal, use_fp8_attn=use_fp8_attn)
+        out = _attention(query, key, value, dropout_p=dropout_p, is_causal=is_causal)
 
     elif get_ulysses_parallel_world_size() == 1: # Ring only
         out = ring_attn(query, key, value, dropout_p=dropout_p, is_causal=is_causal)
 
     else:
         if get_ring_parallel_world_size() == 1: # Ulysses only
-            out = _attention(query, key, value, dropout_p=dropout_p, is_causal=is_causal, use_fp8_attn=use_fp8_attn)
+            out = _attention(query, key, value, dropout_p=dropout_p, is_causal=is_causal)
         else: # USP
             out = ring_attn(query, key, value, dropout_p=dropout_p, is_causal=is_causal)
         out = _ft_c_output_all_to_all(out)

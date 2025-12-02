@@ -71,8 +71,7 @@ def parallelize_transformer(pipe):
         else:
             lora_scale = 1.0
 
-        runtime = get_runtime_state()
-        runtime.increment_step_counter()
+        get_runtime_state().increment_step_counter()
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -261,8 +260,10 @@ def main():
 
     if engine_config.runtime_config.use_hybrid_fp8_attn:
         guidance_scale = input_config.guidance_scale
-        fp8_steps_threshold = 3*2 if guidance_scale > 1.0 else 3
-        total_steps = input_config.num_inference_steps*2 if guidance_scale > 1.0 else input_config.num_inference_steps
+        multiplier = 2 if guidance_scale > 1.0 else 1 # CFG is switched on in this case and double the transformers are called
+        fp8_steps_threshold = 3 * multiplier # Number of initial and final steps to use bf16 attention for stability
+        total_steps = input_config.num_inference_steps * multiplier # Total number of transformer calls during the denoising process
+        # Create a boolean vector indicating which steps should use fp8 attention
         fp8_decision_vector = torch.tensor(
         [i >= fp8_steps_threshold and i < (total_steps - fp8_steps_threshold)
             for i in range(total_steps)], dtype=torch.bool)

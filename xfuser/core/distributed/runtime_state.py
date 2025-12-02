@@ -166,6 +166,11 @@ class DiTRuntimeState(RuntimeState):
                 raise RuntimeError("aiter fp8 flash attention is not available")
 
     def increment_step_counter(self):
+        """
+        Keep track of the current denoising step, and set fp8 flag based on the current step.
+        Used for hybrid fp8 attention, when toggling between bf16 and fp8 is needed.
+        When the entire denoising process is over, the step counter is reset to 0.
+        """
         if self.use_hybrid_fp8_attn:
             self.runtime_config.use_fp8_attn = self.fp8_decision_vector[self.step_counter]
             self.step_counter += 1
@@ -173,6 +178,11 @@ class DiTRuntimeState(RuntimeState):
                 self.step_counter = 0
 
     def set_hybrid_attn_parameters(self, fp8_decision_vector: torch.Tensor):
+        """
+        Set the parameters for hybrid fp8 attention.
+        fp8_decision_vector: A boolean tensor of length equal to the total number of denoising steps.
+        Each element indicates whether to use fp8 attention (True) or bf16 attention (False).
+        """
         self.fp8_decision_vector = fp8_decision_vector
         self.total_steps = len(fp8_decision_vector)
         self.step_counter = 0
