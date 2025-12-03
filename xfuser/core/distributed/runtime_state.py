@@ -165,6 +165,11 @@ class DiTRuntimeState(RuntimeState):
             except ImportError:
                 raise RuntimeError("aiter fp8 flash attention is not available")
 
+            if self.parallel_config.sp_config.ring_degree > 1:
+                raise RuntimeError(
+                    "Fp8 attention is not supported with ring flash attention"
+                )
+
     def increment_step_counter(self):
         """
         Keep track of the current denoising step, and set fp8 flag based on the current step.
