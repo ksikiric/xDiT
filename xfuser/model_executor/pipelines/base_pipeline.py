@@ -156,7 +156,6 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
 
         # backbone
         transformer = getattr(pipeline, "transformer", None)
-        transformer_2 = getattr(pipeline, "transformer_2", None)
         unet = getattr(pipeline, "unet", None)
         # vae
         vae = getattr(pipeline, "vae", None)
@@ -166,13 +165,6 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         if transformer is not None:
             pipeline.transformer = self._convert_transformer_backbone(
                 transformer,
-                enable_torch_compile=engine_config.runtime_config.use_torch_compile,
-                enable_onediff=engine_config.runtime_config.use_onediff,
-                cache_args=cache_args,
-            )
-        if transformer_2 is not None:
-            pipeline.transformer_2 = self._convert_transformer_backbone(
-                transformer_2,
                 enable_torch_compile=engine_config.runtime_config.use_torch_compile,
                 enable_onediff=engine_config.runtime_config.use_onediff,
                 cache_args=cache_args,
@@ -196,10 +188,6 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             self.module.transformer, "reset_activation_cache"
         ):
             self.module.transformer.reset_activation_cache()
-        if hasattr(self.module, "transformer_2") and hasattr(
-            self.module.transformer_2, "reset_activation_cache"
-        ):
-            self.module.transformer_2.reset_activation_cache()
         if hasattr(self.module, "unet") and hasattr(
             self.module.unet, "reset_activation_cache"
         ):

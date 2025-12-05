@@ -1,36 +1,16 @@
 import torch
-import math
-from typing import Optional, Any, Dict, Optional, Union, Tuple
+from typing import Optional
 
-from diffusers.models.transformers.transformer_wan import WanAttnProcessor, WanAttention, WanTransformer3DModel
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+from diffusers.models.transformers.transformer_wan import WanAttention
 
 from xfuser.model_executor.layers.usp import USP
 from xfuser.core.distributed import get_sequence_parallel_world_size
 from xfuser.model_executor.layers.attention_processor import (
     set_hybrid_seq_parallel_attn,
-    xFuserAttentionProcessorRegister,
-    xFuserAttentionBaseWrapper,
+    xFuserAttentionProcessorRegister
 )
-from xfuser.model_executor.models.transformers.register import (
-    xFuserTransformerWrappersRegister,
-)
-from xfuser.model_executor.models.transformers.base_transformer import (
-    xFuserTransformerBaseWrapper,
-)
-from xfuser.model_executor.layers import xFuserLayerWrappersRegister
-
 from xfuser.envs import PACKAGES_CHECKER
-
-from xfuser.core.distributed import (
-    get_world_group,
-    get_runtime_state,
-    get_sp_group,
-    get_sequence_parallel_world_size,
-    get_sequence_parallel_rank,
-    initialize_runtime_state,
-    is_dp_last_group,
-)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
