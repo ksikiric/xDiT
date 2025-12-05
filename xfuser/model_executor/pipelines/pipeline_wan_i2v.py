@@ -320,7 +320,8 @@ class xFuserWanImageToVideoPipeline(xFuserPipelineBaseWrapper):
                 if self.interrupt:
                     continue
                 if hybrid_attention:
-                    self.engine_config.runtime_config.use_fp8_attn = use_fp8_flash_attn[i].item()
+                    # Keep as tensor to avoid graph breaks with torch.compile
+                    self.engine_config.runtime_config.use_fp8_attn = use_fp8_flash_attn[i]
         #! ---------------------------------------- MODIFIED ABOVE ----------------------------------------
 
                 self._current_timestep = t

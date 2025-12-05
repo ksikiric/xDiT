@@ -158,12 +158,20 @@ class DiTRuntimeState(RuntimeState):
                 * pipeline.transformer.config.attention_head_dim,
             )
         self.use_hybrid_fp8_attn = False
+        self.use_static_quantization = True
         if (self.runtime_config.use_fp8_attn or self.runtime_config.use_hybrid_fp8_attn) and envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
             # TODO: Same check but for flash attention.
             try:
                 from aiter import flash_attn_fp8_pertensor_func
             except ImportError:
                 raise RuntimeError("aiter fp8 flash attention is not available")
+            try:
+                import inspect
+                HAS_DESCALE = "q_descale" in inspect.signature(flash_attn_fp8_pertensor_func).parameters
+            except Exception:
+                HAS_DESCALE = False
+            if not HAS_DESCALE:
+                raise RuntimeError("aiter fp8 flash attention with descale is not supported in the installed aiter version")
 
             if self.parallel_config.sp_config.ring_degree > 1:
                 raise RuntimeError(
@@ -175,23 +183,41 @@ class DiTRuntimeState(RuntimeState):
         Keep track of the current denoising step, and set fp8 flag based on the current step.
         Used for hybrid fp8 attention, when toggling between bf16 and fp8 is needed.
         When the entire denoising process is over, the step counter is reset to 0.
+
+        Note: step_counter is kept as a tensor and all operations use tensor ops
+        to avoid graph breaks with torch.compile.
         """
         if self.use_hybrid_fp8_attn:
+            # Tensor indexing - no graph break
             self.runtime_config.use_fp8_attn = self.fp8_decision_vector[self.step_counter]
-            self.step_counter += 1
-            if self.step_counter >= self.total_steps:
-                self.step_counter = 0
+            # Tensor addition - no graph break
+            self.step_counter = self.step_counter + 1
 
-    def set_hybrid_attn_parameters(self, fp8_decision_vector: torch.Tensor):
+    def set_hybrid_attn_parameters(self, fp8_decision_vector: torch.Tensor, static_quantization: bool = True):
         """
         Set the parameters for hybrid fp8 attention.
         fp8_decision_vector: A boolean tensor of length equal to the total number of denoising steps.
         Each element indicates whether to use fp8 attention (True) or bf16 attention (False).
+
+        Note: For torch.compile compatibility:
+        - step_counter is initialized as a tensor (not Python int) to avoid graph breaks
+        - fp8_decision_vector should be on the same device as your model (typically cuda)
         """
         self.fp8_decision_vector = fp8_decision_vector
-        self.total_steps = len(fp8_decision_vector)
-        self.step_counter = 0
+        # Initialize as tensor on same device as decision vector to avoid graph breaks
+        self.step_counter = torch.tensor(0, dtype=torch.long, device=fp8_decision_vector.device)
         self.use_hybrid_fp8_attn = True
+        self.use_static_quantization = static_quantization # Whether to use static quantization for fp8 attention
+
+    def reset_step_counter(self):
+        if self.use_hybrid_fp8_attn:
+            self.step_counter = torch.tensor(0, dtype=torch.long, device=self.fp8_decision_vector.device)
+    
+    def set_static_quantization(self, use_static_quantization: bool):
+        """
+        Set whether to use static quantization for fp8 attention.
+        """
+        self.use_static_quantization = use_static_quantization
 
     def set_input_parameters(
         self,

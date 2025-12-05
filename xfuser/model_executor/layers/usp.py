@@ -174,16 +174,28 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
+    runtime = get_runtime_state()
+
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
-    # Descale not yet supported in AITER.
-    quant_q, _ = aiter.per_tensor_quant(query, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    quant_k, _ = aiter.per_tensor_quant(key, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    quant_v, _ = aiter.per_tensor_quant(value, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    torch._dynamo.graph_break()
+    scale = None
+    if runtime.use_static_quantization:
+        scale = torch.tensor(1, device=query.device)
+
+    quant_q, descale_q = aiter.per_tensor_quant(query,scale=scale, quant_dtype=quant_dtype)
+    quant_k, descale_k = aiter.per_tensor_quant(key, scale=scale, quant_dtype=quant_dtype)
+    quant_v, descale_v = aiter.per_tensor_quant(value, scale=scale, quant_dtype=quant_dtype)
+    attn_kwargs = {
+        "causal": is_causal,
+        "q_descale": descale_q if scale is None else None,
+        "k_descale": descale_k if scale is None else None,
+        "v_descale": descale_v if scale is None else None,
+    }
+    if not runtime.use_hybrid_fp8_attn:
+        torch._dynamo.graph_break() # Why is this needed here? It works when running hybrid attn but not full fp8
     output = aiter.flash_attn_fp8_pertensor_func(
         quant_q, quant_k, quant_v,
-        causal=is_causal,
+        **attn_kwargs
     )
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse

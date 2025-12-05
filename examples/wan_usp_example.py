@@ -264,6 +264,7 @@ def main():
         fp8_steps_threshold = 3 * multiplier # Number of initial and final steps to use bf16 attention for stability
         total_steps = input_config.num_inference_steps * multiplier # Total number of transformer calls during the denoising process
         # Create a boolean vector indicating which steps should use fp8 attention
+        # Note: specifying device=f"cuda:{local_rank}" regresses performance here for some reason
         fp8_decision_vector = torch.tensor(
         [i >= fp8_steps_threshold and i < (total_steps - fp8_steps_threshold)
             for i in range(total_steps)], dtype=torch.bool)
@@ -291,6 +292,7 @@ def main():
         torch.cuda.synchronize()
         if is_dp_last_group():
             print(f"Iteration took {end - start}s, Peak memory: {peak_memory / 1024 ** 2:.2f} MB")
+        get_runtime_state().reset_step_counter()
         return output
 
     if engine_config.runtime_config.use_torch_compile:
