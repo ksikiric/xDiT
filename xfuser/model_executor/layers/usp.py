@@ -55,7 +55,7 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
                 1,
-                _attention,
+                _aiter_bf16_attn_call if HAS_AITER else _flash_attn_call,
                 query,
                 key,
                 value,
@@ -85,7 +85,7 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
                 1,
-                _attention,
+                _aiter_bf16_attn_call,
                 query,
                 key,
                 value,
@@ -94,7 +94,7 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
         elif HAS_FLASH_ATTN:
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
-                _attention,
+                _flash_attn_call,
                 query,
                 key,
                 value,
