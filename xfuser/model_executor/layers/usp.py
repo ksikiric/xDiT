@@ -22,6 +22,7 @@ from xfuser.core.distributed import (
 from packaging.version import parse
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.core.distributed import get_runtime_state
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_FLASH_ATTN = env_info["has_flash_attn"]
 if HAS_FLASH_ATTN:
@@ -50,21 +51,11 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
             "dropout_p": dropout_p,
             "is_causal": is_causal,
         }
-        if HAS_AITER:
+        if HAS_AITER or HAS_FLASH_ATTN:
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
                 1,
-                _aiter_attn_call,
-                query,
-                key,
-                value,
-                **kwargs,
-            )
-        elif HAS_FLASH_ATTN:
-            out, *_ = _templated_ring_attention(
-                PROCESS_GROUP.RING_PG,
-                1,
-                _flash_attn_call,
+                _aiter_bf16_attn_call if HAS_AITER else _flash_attn_call,
                 query,
                 key,
                 value,
@@ -94,7 +85,7 @@ def ring_attn(query, key, value, dropout_p=0.0, is_causal=False):
             out, *_ = _templated_ring_attention(
                 PROCESS_GROUP.RING_PG,
                 1,
-                _aiter_attn_call,
+                _aiter_bf16_attn_call,
                 query,
                 key,
                 value,
@@ -174,8 +165,7 @@ def _ft_c_output_all_to_all(x):
     x = x.reshape(world_size, s // world_size, b, -1, d).permute(2, 0, 3, 1, 4).reshape(b, -1, s // world_size, d)
     return x
 
-
-def _aiter_attn_call(query, key, value, dropout_p, is_causal):
+def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
     """
     Performs the necessary tensor permutes and
     then calls attention through AITER
@@ -183,6 +173,30 @@ def _aiter_attn_call(query, key, value, dropout_p, is_causal):
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    softmax_lse = None
+    quant_dtype = aiter.dtypes.fp8
+    # Descale not yet supported in AITER.
+    quant_q, _ = aiter.per_tensor_quant(query, scale=torch.tensor(1), quant_dtype=quant_dtype)
+    quant_k, _ = aiter.per_tensor_quant(key, scale=torch.tensor(1), quant_dtype=quant_dtype)
+    quant_v, _ = aiter.per_tensor_quant(value, scale=torch.tensor(1), quant_dtype=quant_dtype)
+    torch._dynamo.graph_break()
+    output = aiter.flash_attn_fp8_pertensor_func(
+        quant_q, quant_k, quant_v,
+        causal=is_causal,
+    )
+    output = torch.permute(output, [0, 2, 1, 3])
+    return output, softmax_lse
+
+def _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal):
+    """
+    Performs the necessary tensor permutes and
+    then calls attention through AITER
+    """
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
     attn_kwargs = {
         "dropout_p": dropout_p,
         "causal": is_causal,
@@ -205,6 +219,7 @@ def _flash_attn_call(query, key, value, dropout_p, is_causal):
     Performs the necessary tensor permutes and
     then calls attention through flash_attn
     """
+
     query = torch.permute(query, [0, 2, 1, 3])
     key = torch.permute(key, [0, 2, 1, 3])
     value = torch.permute(value, [0, 2, 1, 3])
@@ -223,10 +238,17 @@ def _attention(query, key, value, dropout_p, is_causal):
     """
     Calls the correct attention mechanism based on the available libraries
     """
+    use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
     if HAS_AITER:
-        output, _ = _aiter_attn_call(query, key, value, dropout_p, is_causal)
+        if use_fp8_attn:
+            output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
+        else:
+            output, _ = _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal)
         return output
     elif HAS_FLASH_ATTN:
+        if use_fp8_attn:
+            # TODO: Add fp8 attention for flash attention.
+            raise RuntimeError("FP8 attention not supported for flash attention yet.")
         output, _ = _flash_attn_call(query, key, value, dropout_p, is_causal)
         return output
     else:
