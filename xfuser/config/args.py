@@ -115,8 +115,6 @@ class xFuserArgs:
     use_teacache: bool = False
     use_fbcache: bool = False
     use_fp8_t5_encoder: bool = False
-    use_fp8_attn: bool = False
-    use_hybrid_fp8_attn: bool = False
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser):
@@ -149,16 +147,6 @@ class xFuserArgs:
         # runtime_group.add_argument("--use_cuda_graph", action="store_true")
         runtime_group.add_argument("--use_parallel_vae", action="store_true")
         # runtime_group.add_argument("--use_profiler", action="store_true")
-        runtime_group.add_argument(
-            "--use_fp8_attn",
-            action="store_true",
-            help="Enable FP8 attention for faster inference.",
-        )
-        runtime_group.add_argument(
-            "--use_hybrid_fp8_attn",
-            action="store_true",
-            help="Enable hybrid FP8 attention for faster inference and improved quality.",
-        )
         runtime_group.add_argument(
             "--use_torch_compile",
             action="store_true",
@@ -412,8 +400,6 @@ class xFuserArgs:
             use_onediff=self.use_onediff,
             # use_profiler=self.use_profiler,
             use_fp8_t5_encoder=self.use_fp8_t5_encoder,
-            use_fp8_attn=self.use_fp8_attn,
-            use_hybrid_fp8_attn=self.use_hybrid_fp8_attn,
         )
 
         parallel_config = ParallelConfig(

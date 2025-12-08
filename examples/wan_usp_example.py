@@ -210,6 +210,16 @@ def parallelize_transformer(pipe):
 def main():
     parser = FlexibleArgumentParser(description="xFuser Arguments")
     parser.add_argument(
+        "--use_fp8_attn",
+        action="store_true",
+        help="Enable FP8 attention for faster inference."
+    )
+    parser.add_argument(
+        "--use_hybrid_fp8_attn",
+        action="store_true",
+        help="Enable hybrid FP8 attention for faster inference and improved quality."
+    )
+    parser.add_argument(
         "--task",
         type=str,
         required=True,
@@ -258,16 +268,18 @@ def main():
                 print(f"Adjusting height and width to be multiples of {mod_value}. New dimensions: {height}x{width}")
         image = None
 
-    if engine_config.runtime_config.use_hybrid_fp8_attn:
-        guidance_scale = input_config.guidance_scale
-        multiplier = 2 if guidance_scale > 1.0 else 1 # CFG is switched on in this case and double the transformers are called
-        fp8_steps_threshold = 3 * multiplier # Number of initial and final steps to use bf16 attention for stability
-        total_steps = input_config.num_inference_steps * multiplier # Total number of transformer calls during the denoising process
-        # Create a boolean vector indicating which steps should use fp8 attention
-        fp8_decision_vector = torch.tensor(
-        [i >= fp8_steps_threshold and i < (total_steps - fp8_steps_threshold)
-            for i in range(total_steps)], dtype=torch.bool)
-        get_runtime_state().set_hybrid_attn_parameters(fp8_decision_vector)
+    if args.use_fp8_attn or args.use_hybrid_fp8_attn:
+        get_runtime_state().check_fp8_availability(use_fp8_attn=args.use_fp8_attn, use_hybrid_fp8_attn=args.use_hybrid_fp8_attn)
+        if args.use_hybrid_fp8_attn:
+            guidance_scale = input_config.guidance_scale
+            multiplier = 2 if guidance_scale > 1.0 else 1 # CFG is switched on in this case and double the transformers are called
+            fp8_steps_threshold = 6 * multiplier # Number of initial and final steps to use bf16 attention for stability
+            total_steps = input_config.num_inference_steps * multiplier # Total number of transformer calls during the denoising process
+            # Create a boolean vector indicating which steps should use fp8 attention
+            fp8_decision_vector = torch.tensor(
+            [i >= fp8_steps_threshold and i < (total_steps - fp8_steps_threshold)
+                for i in range(total_steps)], dtype=torch.bool)
+            get_runtime_state().set_hybrid_attn_parameters(fp8_decision_vector)
 
     def run_pipe(input_config, image):
         torch.cuda.reset_peak_memory_stats()

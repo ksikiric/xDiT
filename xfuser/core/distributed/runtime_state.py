@@ -158,7 +158,10 @@ class DiTRuntimeState(RuntimeState):
                 * pipeline.transformer.config.attention_head_dim,
             )
         self.use_hybrid_fp8_attn = False
-        if (self.runtime_config.use_fp8_attn or self.runtime_config.use_hybrid_fp8_attn):
+        self.use_fp8_attn = False
+    
+    def check_fp8_availability(self, use_fp8_attn: bool, use_hybrid_fp8_attn: bool):
+        if (use_fp8_attn or use_hybrid_fp8_attn):
             if envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
                 try:
                     from aiter import flash_attn_fp8_pertensor_func
@@ -174,7 +177,7 @@ class DiTRuntimeState(RuntimeState):
                     "Only AITER is currently supported for fp8 attention."
                 )
 
-        if (self.runtime_config.use_fp8_attn and self.runtime_config.use_hybrid_fp8_attn):
+        if (use_fp8_attn and use_hybrid_fp8_attn):
             raise RuntimeError("Choose either fp8 attention or hybrid fp8 attention, not both.")
 
     def increment_step_counter(self):
@@ -184,7 +187,7 @@ class DiTRuntimeState(RuntimeState):
         When the entire denoising process is over, the step counter is reset to 0.
         """
         if self.use_hybrid_fp8_attn:
-            self.runtime_config.use_fp8_attn = self.fp8_decision_vector[self.step_counter]
+            self.use_fp8_attn = self.fp8_decision_vector[self.step_counter]
             self.step_counter += 1
             if self.step_counter >= self.total_steps:
                 self.step_counter = 0

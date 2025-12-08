@@ -129,7 +129,7 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 def _check_if_use_fp8_attn():
     use_fp8_attn = False
     try:
-        use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
+        use_fp8_attn = get_runtime_state().use_fp8_attn
     except:
         pass
     if not HAS_AITER and use_fp8_attn:
