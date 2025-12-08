@@ -174,6 +174,9 @@ class DiTRuntimeState(RuntimeState):
                     "Only AITER is currently supported for fp8 attention."
                 )
 
+        if (self.runtime_config.use_fp8_attn and self.runtime_config.use_hybrid_fp8_attn):
+            raise RuntimeError("Choose either fp8 attention or hybrid fp8 attention, not both.")
+
     def increment_step_counter(self):
         """
         Keep track of the current denoising step, and set fp8 flag based on the current step.
