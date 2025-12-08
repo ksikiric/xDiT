@@ -126,6 +126,16 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.wait()
     return tensor
 
+def _check_if_use_fp8_attn():
+    use_fp8_attn = False
+    try:
+        use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
+    except:
+        pass
+    if not HAS_AITER and use_fp8_attn:
+        raise RuntimeError("FP8 attention requested but AITER is not available.")
+    return use_fp8_attn
+
 
 def _sdpa_all_to_all_single(x):
     x_shape = x.shape
@@ -177,10 +187,10 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
     # Descale not yet supported in AITER.
-    quant_q, _ = aiter.per_tensor_quant(query, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    quant_k, _ = aiter.per_tensor_quant(key, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    quant_v, _ = aiter.per_tensor_quant(value, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    torch._dynamo.graph_break()
+    quant_q, _ = aiter.per_tensor_quant(query, scale=torch.tensor(1, device=query.device), quant_dtype=quant_dtype)
+    quant_k, _ = aiter.per_tensor_quant(key, scale=torch.tensor(1, device=key.device), quant_dtype=quant_dtype)
+    quant_v, _ = aiter.per_tensor_quant(value, scale=torch.tensor(1, device=value.device), quant_dtype=quant_dtype)
+    torch._dynamo.graph_break() # Without this line, fp8 call will crash due to q and k dont have the same dtype, which is not true.
     output = aiter.flash_attn_fp8_pertensor_func(
         quant_q, quant_k, quant_v,
         causal=is_causal,
@@ -238,7 +248,7 @@ def _attention(query, key, value, dropout_p, is_causal):
     """
     Calls the correct attention mechanism based on the available libraries
     """
-    use_fp8_attn = get_runtime_state().runtime_config.use_fp8_attn
+    use_fp8_attn = _check_if_use_fp8_attn()
     if HAS_AITER:
         if use_fp8_attn:
             output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
@@ -246,9 +256,6 @@ def _attention(query, key, value, dropout_p, is_causal):
             output, _ = _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal)
         return output
     elif HAS_FLASH_ATTN:
-        if use_fp8_attn:
-            # TODO: Add fp8 attention for flash attention.
-            raise RuntimeError("FP8 attention not supported for flash attention yet.")
         output, _ = _flash_attn_call(query, key, value, dropout_p, is_causal)
         return output
     else:

@@ -158,16 +158,20 @@ class DiTRuntimeState(RuntimeState):
                 * pipeline.transformer.config.attention_head_dim,
             )
         self.use_hybrid_fp8_attn = False
-        if (self.runtime_config.use_fp8_attn or self.runtime_config.use_hybrid_fp8_attn) and envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
-            # TODO: Same check but for flash attention.
-            try:
-                from aiter import flash_attn_fp8_pertensor_func
-            except ImportError:
-                raise RuntimeError("aiter fp8 flash attention is not available")
+        if (self.runtime_config.use_fp8_attn or self.runtime_config.use_hybrid_fp8_attn):
+            if envs.PACKAGES_CHECKER.packages_info["has_aiter"]:
+                try:
+                    from aiter import flash_attn_fp8_pertensor_func
+                except ImportError:
+                    raise RuntimeError("aiter fp8 flash attention is not available")
 
-            if self.parallel_config.sp_config.ring_degree > 1:
+                if self.parallel_config.sp_config.ring_degree > 1:
+                    raise RuntimeError(
+                        "Fp8 attention is not supported with ring flash attention"
+                    )
+            else:
                 raise RuntimeError(
-                    "Fp8 attention is not supported with ring flash attention"
+                    "Only AITER is currently supported for fp8 attention."
                 )
 
     def increment_step_counter(self):
