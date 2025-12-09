@@ -59,6 +59,8 @@ def parallelize_transformer(pipe: DiffusionPipeline):
         else:
             lora_scale = 1.0
 
+        get_runtime_state().increment_step_counter()
+
         if USE_PEFT_BACKEND:
             # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
@@ -266,9 +268,23 @@ def main():
     parameter_peak_memory = torch.cuda.max_memory_allocated(
         device=f"cuda:{local_rank}")
 
+    if engine_config.runtime_config.use_hybrid_fp8_attn:
+        #guidance_scale = input_config.guidance_scale
+        multiplier = 1
+        fp8_steps_threshold = 3 * multiplier # Number of initial and final steps to use bf16 attention for stability
+        total_steps = input_config.num_inference_steps * multiplier # Total number of transformer calls during the denoising process
+        # Create a boolean vector indicating which steps should use fp8 attention
+        # Breaks if not device is specified...
+        fp8_decision_vector = torch.tensor(
+        [i >= fp8_steps_threshold and i < (total_steps - fp8_steps_threshold)
+            for i in range(total_steps)], dtype=torch.bool, device=f"cuda:{local_rank}")
+        get_runtime_state().set_hybrid_attn_parameters(fp8_decision_vector, False)
+    elif engine_config.runtime_config.use_fp8_attn:
+        get_runtime_state().set_static_quantization(False)
+
     if engine_config.runtime_config.use_torch_compile:
         torch._inductor.config.reorder_for_compute_comm_overlap = True
-        pipe.transformer.compile()
+        pipe.transformer = torch.compile(pipe.transformer, mode="default")
 
         # one step to warmup the torch compiler
         output = pipe(
@@ -276,11 +292,12 @@ def main():
             width=input_config.width,
             num_frames=input_config.num_frames,
             prompt=input_config.prompt,
-            num_inference_steps=1,
+            num_inference_steps=input_config.num_inference_steps if engine_config.runtime_config.use_hybrid_fp8_attn else 1,
             guidance_scale=input_config.guidance_scale,
             generator=torch.Generator(device="cuda").manual_seed(
                 input_config.seed),
         ).frames[0]
+        get_runtime_state().reset_step_counter()
 
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
@@ -295,6 +312,7 @@ def main():
         generator=torch.Generator(device="cuda").manual_seed(
             input_config.seed),
     )
+    get_runtime_state().reset_step_counter()
 
     end_time = time.time()
     elapsed_time = end_time - start_time
