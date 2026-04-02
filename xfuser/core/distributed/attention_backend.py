@@ -4,6 +4,7 @@ import inspect
 import torch.nn.functional as F
 from enum import Enum
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
+from xfuser.core.distributed.ssta import setup_ssta, get_sparse_mask, untile_ssta_output
 
 ATTENTION_FUNCTION_REGISTRY = {}
 
@@ -79,6 +80,10 @@ if env_info["has_aiter"]:
         )
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SAGE_V2 is not available.
+    try:
+        from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+    except ImportError:
+        pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
 
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
@@ -111,7 +116,9 @@ class AttentionBackendType(Enum):
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
     AITER_SAGE = "AITER Sage"
+    AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
+    AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
     NPU = "NPU"
 
 def register_attention_function(backend_type):
@@ -124,7 +131,7 @@ def register_attention_function(backend_type):
     return decorator
 
 @register_attention_function(AttentionBackendType.SDPA)
-def _sdpa_attn_call(query, key, value, dropout_p, is_causal):
+def _sdpa_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs attention through PyTorch's scaled_dot_product_attention.
     Allows Pytorch to decide which SDPA backend to use.
@@ -135,7 +142,7 @@ def _sdpa_attn_call(query, key, value, dropout_p, is_causal):
     return output, None
 
 @register_attention_function(AttentionBackendType.SDPA_FLASH)
-def _sdpa_flash_attn_call(query, key, value, dropout_p, is_causal):
+def _sdpa_flash_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs flash attention using Pytorch's internal implementation.
     """
@@ -149,7 +156,7 @@ def _sdpa_flash_attn_call(query, key, value, dropout_p, is_causal):
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.SDPA_MATH)
-def _sdpa_math_attn_call(query, key, value, dropout_p, is_causal):
+def _sdpa_math_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs attention using Pytorch's internal math implementation.
     """
@@ -163,7 +170,7 @@ def _sdpa_math_attn_call(query, key, value, dropout_p, is_causal):
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.SDPA_EFFICIENT)
-def _sdpa_efficient_attn_call(query, key, value, dropout_p, is_causal):
+def _sdpa_efficient_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs attention using Pytorch's internal memory-efficient implementation.
     """
@@ -179,7 +186,7 @@ def _sdpa_efficient_attn_call(query, key, value, dropout_p, is_causal):
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.CUDNN)
-def _cudnn_attn_call(query, key, value, dropout_p, is_causal):
+def _cudnn_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through cuDNN backend
@@ -197,7 +204,7 @@ def _cudnn_attn_call(query, key, value, dropout_p, is_causal):
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.FLASH_3)
-def _flash_attn_3_call(query, key, value, dropout_p, is_causal):
+def _flash_attn_3_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through flash_attn V3
@@ -235,7 +242,7 @@ def per_tensor_quant(
     return y.to(quant_dtype), scale.expand(*x.shape[:2]).to(scale_dtype)
 
 @register_attention_function(AttentionBackendType.FLASH_3_FP8)
-def _flash_attn_3_fp8_call(query, key, value, dropout_p, is_causal):
+def _flash_attn_3_fp8_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through flash_attn V3
@@ -263,7 +270,7 @@ def _flash_attn_3_fp8_call(query, key, value, dropout_p, is_causal):
 
 @register_attention_function(AttentionBackendType.FLASH_4)
 @torch.compiler.disable # Disabling compile, as it is not currently supported with FAv4
-def _flash_attn_4_call(query, key, value, dropout_p, is_causal):
+def _flash_attn_4_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through flash_attn V4
@@ -282,7 +289,7 @@ def _flash_attn_4_call(query, key, value, dropout_p, is_causal):
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.AITER_FP8)
-def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
+def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through AITER
@@ -318,9 +325,9 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
                                                 quant_dtype=quant_dtype,
                                                 dtypeMax=dtypeMax)
 
-    attn_kwargs = {}
+    kwargs = {}
     if AITER_FP8_HAS_DESCALE:
-        attn_kwargs = {
+        kwargs = {
                 "q_descale": q_descale,
                 "k_descale": k_descale,
                 "v_descale": v_descale,
@@ -328,13 +335,13 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
     output = aiter.flash_attn_fp8_pertensor_func(
         quant_q, quant_k, quant_v,
         causal=is_causal,
-        **attn_kwargs
+        **kwargs
     )
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.AITER)
-def _aiter_attn_call(query, key, value, dropout_p, is_causal):
+def _aiter_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through AITER
@@ -342,25 +349,25 @@ def _aiter_attn_call(query, key, value, dropout_p, is_causal):
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
-    attn_kwargs = {
+    kwargs = {
         "dropout_p": dropout_p,
         "causal": is_causal,
         "return_attn_probs": False,
         "return_lse": True,
     }
     if AITER_HAS_ROUND_MODE:
-        attn_kwargs["how_v3_bf16_cvt"] = HOW_V3_BF16_CVT
+        kwargs["how_v3_bf16_cvt"] = HOW_V3_BF16_CVT
     output, softmax_lse = flash_attn_func_aiter(
         query,
         key,
         value,
-        **attn_kwargs
+        **kwargs
     )
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.FLASH)
-def _flash_attn_call(query, key, value, dropout_p, is_causal):
+def _flash_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor permutes and
     then calls attention through flash_attn
@@ -380,7 +387,7 @@ def _flash_attn_call(query, key, value, dropout_p, is_causal):
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.NPU)
-def npu_flash_attn_call(query, key, value, dropout_p, is_causal):
+def npu_flash_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
     Performs the necessary tensor transpose and
     then calls attention through npu_fused_infer_attention_score
@@ -403,15 +410,15 @@ def npu_flash_attn_call(query, key, value, dropout_p, is_causal):
     return block_out, block_lse
 
 @register_attention_function(AttentionBackendType.AITER_SAGE)
-def _aiter_sage_attn_call(query, key, value, dropout_p, is_causal):
+def _aiter_sage_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     # Pass layout="bhsd" to avoid permutation
     softmax_lse = None
     attn_fn = functools.partial(fav3_sage_wrapper_func, layout="bhsd")
-    output = attn_fn(query, key, value)
+    output, _ = attn_fn(query, key, value)
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.AITER_SAGE_V2)
-def _aiter_sage_v2_attn_call(query, key, value, dropout_p, is_causal):
+def _aiter_sage_v2_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     # Contiguous is needed for Sage v2 in older AITER versions. 
     # This has been fixed in newer version of AITER, meaning the
     # contiguous calls can be removed in the future.
@@ -425,7 +432,7 @@ def _aiter_sage_v2_attn_call(query, key, value, dropout_p, is_causal):
 
 
 @register_attention_function(AttentionBackendType.SAGE)
-def _sage_attn_call(query, key, value, dropout_p, is_causal):
+def _sage_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     output, softmax_lse = sageattn(
         query,
         key,
@@ -434,3 +441,42 @@ def _sage_attn_call(query, key, value, dropout_p, is_causal):
         return_lse=True
     )
     return output, softmax_lse
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARSE_SAGE)
+def _aiter_sparse_sage_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    config = {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": False,
+        "num_stages": 2,
+        "num_warps": 8,
+    }
+    attn_fn = functools.partial(fav3_sage_wrapper_func, layout="bhsd", config=config)
+    q, k, v, mask_config, ssta_state = setup_ssta(query, key, value, attention_kwargs)
+    block_mask = get_sparse_mask(mask_config, sparse_type=attention_kwargs["attn_sparse_type"])
+    block_lut = block_attn_mask_to_ragged_lut(block_mask, q.shape[1])
+    output, _ = attn_fn(q, k, v, block_lut=block_lut)
+    output = untile_ssta_output(output, ssta_state, attention_kwargs["encoder_sequence_length"], attention_kwargs["sp_size"])
+    return output, None
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARSE_SAGE_V2)
+def _aiter_sparse_sage_v2_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    config = {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": False,
+        "num_stages": 3,
+        "num_warps": 8,
+    }
+    attn_fn = functools.partial(fav3_sage_mxfp4_wrapper, layout="bhsd", hadamard_rotation=True, R=HADAMARD_MATRIX[query.device], config=config)
+    q, k, v, mask_config, ssta_state = setup_ssta(query, key, value, attention_kwargs)
+    block_mask = get_sparse_mask(mask_config, sparse_type=attention_kwargs["attn_sparse_type"])
+    block_lut = block_attn_mask_to_ragged_lut(block_mask, q.shape[1])
+    output = attn_fn(q, k, v, causal=is_causal, block_lut=block_lut)
+    output = untile_ssta_output(output, ssta_state, attention_kwargs["encoder_sequence_length"], attention_kwargs["sp_size"])
+    return output, None
+
