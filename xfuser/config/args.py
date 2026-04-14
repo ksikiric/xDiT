@@ -151,6 +151,8 @@ class xFuserArgs:
     # Hybrid GEMM schedule (FP8 high precision + FP4 low precision)
     use_hybrid_gemm_schedule: bool = False
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
+    # SSTA arguments
+    ssta_tile_thw: Optional[Tuple[int, int, int]] = None
 
 
     @staticmethod
@@ -693,6 +695,12 @@ class xFuserArgs:
             action="store_true",
             default=False,
             help="Use channels last memory format for the VAE.",
+        )
+        parser.add_argument(
+            "--ssta_tile_thw",
+            type=lambda s: tuple(int(x) for x in s.split(",")),
+            default=(2,8,8),
+            help="Tile size for SSTA as comma-separated T,H,W. E.g. --ssta_tile_thw 2,8,8",
         )
         return parser
 
