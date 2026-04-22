@@ -549,25 +549,42 @@ def _flash_attn_4_fp4_call(query, key, value, dropout_p, is_causal):
 def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
     """
     Performs the necessary tensor permutes and
-    then calls attention through AITER
+    then calls attention through AITER FP8.
+    Input layout is BHSD. On gfx950 the kernel requires BHSD physical layout
+    presented as a BSHD view (non-contiguous transpose).
     """
-    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
-    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
-    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # Ensure inputs are contiguous BHSD before quantization
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
+    # Pad seq dimension (dim=2, BHSD layout) to a multiple of 256
+    orig_query_seqlen = query.shape[2]
+    pad_multiple = 256
+
+    def _pad_to(x, target_len):
+        pad_len = target_len - x.shape[2]
+        if pad_len > 0:
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_len))
+        return x
+
+    def _round_up(length):
+        return ((length + pad_multiple - 1) // pad_multiple) * pad_multiple
+
+    query = _pad_to(query, _round_up(query.shape[2]))
+    key   = _pad_to(key, _round_up(key.shape[2]))
+    value = _pad_to(value, _round_up(value.shape[2]))
 
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
     dtypeMax = torch.finfo(quant_dtype).max
     if AITER_FP8_HAS_DESCALE:
-        # If AITER_FP8_STATIC_SCALE_WITH_DESCALE is not set, use dynamic scaling.
-        # Set the environment variable XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE
-        # to a float value (i.e 2.5) to use static scaling.
         if AITER_FP8_STATIC_SCALE_WITH_DESCALE is None:
             scale = None
         else:
-            scale=torch.tensor(AITER_FP8_STATIC_SCALE_WITH_DESCALE, dtype=torch.float32, device=query.device)
+            scale = torch.tensor(AITER_FP8_STATIC_SCALE_WITH_DESCALE, dtype=torch.float32, device=query.device)
     else:
-        # Use static scale of 1.0, since descale is not available.
         scale = torch.tensor(AITER_FP8_STATIC_SCALE_NO_DESCALE, dtype=torch.float32, device=query.device)
     quant_q, q_descale = aiter.per_tensor_quant(query,
                                                 scale=scale,
@@ -581,7 +598,10 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
                                                 scale=scale,
                                                 quant_dtype=quant_dtype,
                                                 dtypeMax=dtypeMax)
-
+    # Present as BSHD view for the aiter API (BHSD physical layout preserved)
+    quant_q = quant_q.transpose(1, 2)
+    quant_k = quant_k.transpose(1, 2)
+    quant_v = quant_v.transpose(1, 2)
     attn_kwargs = {}
     if AITER_FP8_HAS_DESCALE:
         attn_kwargs = {
@@ -594,7 +614,11 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
         causal=is_causal,
         **attn_kwargs
     )
-    output = torch.permute(output, [0, 2, 1, 3])
+
+    # Trim back to original query seqlen (BSHD after attention)
+    output = output[:, :orig_query_seqlen, ...]
+    output = output.permute(0, 2, 1, 3).contiguous()
+
     return output, softmax_lse
 
 @register_attention_function(AttentionBackendType.AITER)
