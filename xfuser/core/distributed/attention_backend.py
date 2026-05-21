@@ -320,6 +320,10 @@ if env_info["has_aiter"]:
         from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
+    try:
+        from aiter import flash_attn_sage_func as flash_attn_sage_func_aiter
+    except ImportError:
+        pass  # Error is raised in runtime_state.py if AITER_SAGE_CK is not available.
 
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
@@ -369,6 +373,7 @@ class AttentionBackendType(Enum):
     AITER_FP8 = "AITER FP8"
     AITER_MLA = "AITER MLA"
     AITER_SAGE = "AITER Sage"
+    AITER_CK_SAGE = "AITER CK Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
@@ -942,3 +947,13 @@ def _aiter_sparge_v2_attn_call(query, key, value, dropout_p, is_causal, attentio
         R=HADAMARD_MATRIX[query.device], config=config,
     )
     return restore_sparge_output(output, state), None
+
+@register_attention_function(AttentionBackendType.AITER_CK_SAGE)
+def _aiter_sage_ck_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    output = flash_attn_sage_func_aiter(
+        query, key, value,
+        dropout_p=dropout_p,
+        causal=is_causal,
+        layout="bhsd",
+    )
+    return output, None
