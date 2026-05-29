@@ -64,6 +64,7 @@ _SPARSE_ATTENTION_BACKENDS = frozenset({
 })
 _SPARGE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
+    AttentionBackendType.AITER_SPARGE_ASM,
     AttentionBackendType.AITER_SPARGE_V2,
 })
 
