@@ -324,6 +324,15 @@ if env_info["has_aiter"]:
         from aiter.ops.mha import flash_attn_i8fp8_sparse_pertensor_func
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_SPARSE_SAGE_ASM is not available.
+    try:
+        from aiter.ops.mha import flash_attn_i8fp8_pertensor_func
+    except ImportError:
+        pass # Error is raised in runtime_state.py if AITER_I8FP8 is not available.
+    try:
+        from aiter.ops.mha import flash_attn_mxfp4_sparse_pertensor_func
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+    except ImportError:
+        pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_V2 is not available.
 
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
@@ -397,6 +406,7 @@ class AttentionBackendType(Enum):
     FLEX_BLOCK_ATTN = "Flex Block Attention"
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
+    AITER_I8FP8 = "AITER i8fp8 ASM"
     AITER_MLA = "AITER MLA"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
@@ -404,6 +414,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_ASM = "AITER Sparge ASM"
+    AITER_SPARGE_ASM_V2 = "AITER Sparge ASM V2 (mxfp4)"
     AITER_SPARGE_V2 = "AITER Sparge V2"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
@@ -654,6 +665,27 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     )
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
+
+
+@register_attention_function(AttentionBackendType.AITER_I8FP8)
+def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Dense i8fp8 ASM attention (int8 Q/K + fp8 V + fp32 descales)."""
+    q_bshd = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
+    v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    q_int8, k_int8, v_fp8, q_descale, k_descale, v_descale = _asm_sparge_i8fp8_quantize(
+        q_bshd, k_bshd, v_bshd,
+    )
+    softmax_scale = q_bshd.shape[-1] ** -0.5
+    out_bshd = flash_attn_i8fp8_pertensor_func(
+        q_int8, k_int8, v_fp8,
+        q_descale.contiguous(), k_descale.contiguous(), v_descale.contiguous(),
+        causal=is_causal,
+        softmax_scale=float(softmax_scale),
+    )
+    return torch.permute(out_bshd, [0, 2, 1, 3]), None
+
 
 @register_attention_function(AttentionBackendType.AITER)
 def _aiter_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
@@ -960,23 +992,18 @@ def _aiter_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_k
     return restore_sparge_output(output, state), None
 
 
-_AITER_SPARGE_ASM_BLOCK_M  = 256  # kTileQ in the ASM kernel
-_AITER_SPARGE_ASM_BLOCK_N  = 128  # kTileKV
-_AITER_SPARGE_ASM_HEAD_DIM = 128  # kHeadSizeQK / kHeadSizeV
-_AITER_SPARGE_ASM_Q_CLIP   = 1.0  # Sage-style Q/K clip (matches bench_sage's
-_AITER_SPARGE_ASM_K_CLIP   = 1.0  # i8fp8_quantize)
+_AITER_SPARGE_ASM_BLOCK_M  = 256
+_AITER_SPARGE_ASM_BLOCK_N  = 128
+_AITER_SPARGE_ASM_HEAD_DIM = 128
 
 
 def _asm_sparge_i8fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
-    """Sage-style per-tensor quantization: Q,K -> int8, V -> fp8 (e4m3).
-    """
-    q_amax = torch.abs(q_bshd).max() * _AITER_SPARGE_ASM_Q_CLIP
-    q_scale = q_amax / 127.0
+    """Sage-style per-tensor quantization: Q,K -> int8, V -> fp8 (e4m3)."""
+    q_scale = torch.abs(q_bshd).max() / 127.0
     q_int8 = torch.clamp(torch.round(q_bshd / q_scale), -128, 127).to(torch.int8)
     q_descale = q_scale.reshape(1).to(torch.float32)
 
-    k_amax = torch.abs(k_bshd).max() * _AITER_SPARGE_ASM_K_CLIP
-    k_scale = k_amax / 127.0
+    k_scale = torch.abs(k_bshd).max() / 127.0
     k_int8 = torch.clamp(torch.round(k_bshd / k_scale), -128, 127).to(torch.int8)
     k_descale = k_scale.reshape(1).to(torch.float32)
 
@@ -1024,6 +1051,55 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
         q_descale.contiguous(),
         k_descale.contiguous(),
         v_descale.contiguous(),
+        kv_block_indices.to(torch.int32).contiguous(),
+        lut_start.to(torch.int32).contiguous(),
+        lut_count.to(torch.int32).contiguous(),
+        softmax_scale=float(softmax_scale),
+    )
+    output = out_bshd.permute(0, 2, 1, 3)
+    return restore_sparge_output(output, state), None
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_V2)
+def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sparse mxfp4 ASM attention (mxfp4 Q/K + fp8 V)."""
+    # ASM kernel is hard-wired to kTileKV=128; force the LUT block size to
+    # match (Triton tuner may otherwise pick 64).
+    config = {**get_sage_fwd_configs_mxfp4(),
+              "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
+              "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N}
+    q, k, v, state, block_mask, num_heads = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config,
+    )
+
+    q_bshd = q.permute(0, 2, 1, 3).contiguous()
+    k_bshd = k.permute(0, 2, 1, 3).contiguous()
+    v_bshd = v.permute(0, 2, 1, 3).contiguous()
+
+    fp8_type = aiter.dtypes.fp8
+    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+        q_bshd, k_bshd, v_bshd,
+        fp8_type, torch.finfo(fp8_type).max,
+        BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
+        BLKK=64,
+        layout="bshd",
+        R=HADAMARD_MATRIX[q_bshd.device],
+        BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+        q_smoothing=False,
+    )
+
+    kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
+        block_mask,
+        num_heads=num_heads,
+        return_none_if_dense=False,
+        BLOCK_KB=_AITER_SPARGE_ASM_BLOCK_N,
+    )
+
+    # qq.shape[-1] = hd/2 because of fp4 packing.
+    softmax_scale = (qq.shape[-1] * 2) ** -0.5
+    out_bshd = flash_attn_mxfp4_sparse_pertensor_func(
+        qq.contiguous(), kq.contiguous(), vq.contiguous(),
+        qd.contiguous(), kd.contiguous(), vd.to(torch.float32).contiguous(),
         kv_block_indices.to(torch.int32).contiguous(),
         lut_start.to(torch.int32).contiguous(),
         lut_count.to(torch.int32).contiguous(),
