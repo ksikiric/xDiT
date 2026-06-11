@@ -80,14 +80,9 @@ def _aiter_sage_v2_hadamard_matrix(block_r):
 
 
 def _build_hadamard_matrix(block_r, dtype=torch.bfloat16):
-    """Normalized (orthonormal) Hadamard matrix of size block_r x block_r.
-
-    Prefers aiter's ``create_hadamard_matrix`` but falls back to a local
-    Sylvester construction, so the fp8 ASM paths do NOT depend on the sage_v2
-    triton modules being importable. ``block_r`` must be a power of two. The
-    result R satisfies ``R @ R.T == I``, so rotating both Q and K by it leaves
-    ``Q @ K.T`` unchanged.
-    """
+    """Normalized Hadamard matrix (block_r x block_r, R @ R.T == I; block_r a
+    power of two). Uses aiter's create_hadamard_matrix with a local Sylvester
+    fallback, so it doesn't depend on the sage_v2 modules."""
     try:
         try:
             from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
@@ -107,49 +102,18 @@ def _build_hadamard_matrix(block_r, dtype=torch.bfloat16):
         return (H / (block_r ** 0.5)).to(dtype)
 
 
-def _check_aiter_fp8_hadamard():
-    """Whether the dense AITER_FP8 / sparse AITER_SPARGE_ASM_FP8 paths can apply
-    the (quant-time, QK-preserving) Hadamard rotation.
-
-    Decoupled from the sage_v2 triton path: the fp8 kernels use a different entry
-    point (``flash_attn_fp8_pertensor_func`` / ``flash_attn_fp8_sparse_pertensor_func``),
-    so support is gated on one of those being importable -- NOT on sage_v2's
-    ``create_hadamard_matrix``. The rotation matrix itself is always buildable
-    via the local Sylvester fallback in ``_build_hadamard_matrix``.
-    """
-    try:
-        from aiter.ops.mha import flash_attn_fp8_pertensor_func  # noqa: F401
-        return True
-    except ImportError:
-        pass
-    try:
-        from aiter.ops.mha import flash_attn_fp8_sparse_pertensor_func  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 def _aiter_fp8_hadamard_matrix(block_r):
-    """Per-device Hadamard matrix for the fp8 ASM paths (dense + sparse).
-
-    Separate from ``HADAMARD_MATRIX`` (sage_v2): built independently of the
-    sage_v2 modules and gated on the fp8 entry point via ``_check_aiter_fp8_hadamard``.
-    Mirrors ``_aiter_sage_v2_hadamard_matrix``'s per-device dict (value is None
-    when fp8 Hadamard is unsupported) so callers can index by device.
-    """
+    """Per-device Hadamard matrix for the fp8 ASM paths, separate from
+    ``HADAMARD_MATRIX`` (sage_v2) and built independently of the sage_v2
+    modules."""
     hadamard_matrix = {}
-    _hadamard = (
-        _build_hadamard_matrix(block_r, dtype=torch.bfloat16)
-        if _check_aiter_fp8_hadamard()
-        else None
-    )
+    _hadamard = _build_hadamard_matrix(block_r, dtype=torch.bfloat16)
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             device = torch.device(f"cuda:{i}")
-            hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
+            hadamard_matrix[device] = _hadamard.to(device)
     else:
-        device = torch.device("cpu")
-        hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
+        hadamard_matrix[torch.device("cpu")] = _hadamard.to(torch.device("cpu"))
     return hadamard_matrix
 
 def _get_mla_cache_device_key(device):
@@ -417,10 +381,8 @@ if env_info["has_aiter"]:
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
     AITER_FP8_HAS_DESCALE = _check_aiter_fp8_has_descale()
     HADAMARD_MATRIX = _aiter_sage_v2_hadamard_matrix(AITER_SAGE_V2_BLOCK_R)
-    # fp8 ASM paths (dense + sparse) use their OWN Hadamard matrix + support
-    # check: the fp8 entry points differ from sage_v2's, and the rotation is a
-    # quant-time, QK-preserving step. block_r = 128 = head_dim -> full-head
-    # rotation. None per-device when the fp8 entry point is unavailable.
+    # Own Hadamard matrix for the fp8 paths (separate from sage_v2's);
+    # block_r = 128 = head_dim (full-head rotation).
     FP8_HADAMARD_MATRIX = _aiter_fp8_hadamard_matrix(128)
     _TRITON_SSTA_BLOCK_SIZE = 128
     
@@ -700,20 +662,14 @@ def _flash_attn_4_fp4_call(query, key, value, dropout_p, is_causal, attention_kw
     return output, softmax_lse
 
 def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """Orthonormal Hadamard rotation along head_dim (last axis), applied in
-    blocks of ``R.shape[-1]``. ``R`` is the normalized Hadamard matrix
-    (``R @ R.T == I``), so rotating BOTH Q and K by ``R`` leaves ``Q @ K.T``
-    mathematically unchanged -- the ASM kernel sees identical scores -- while
-    spreading per-channel outliers, which lowers the per-tensor fp8
-    quantization error. Only this QK-preserving rotation is applied (no
-    K-mean smoothing: that needs a score correction the ASM kernel can't take).
-    """
+    """Orthonormal Hadamard rotation along head_dim (in blocks of R.shape[-1]).
+    Rotating both Q and K by R leaves Q @ K.T unchanged (kernel sees identical
+    scores) while spreading outliers to cut fp8 quant error."""
     d = x.shape[-1]
     block_r = R.shape[-1]
     R = R.to(x.dtype)
     if block_r == d:
         return torch.matmul(x, R)
-    # block-diagonal rotation: head_dim split into d//block_r chunks of block_r
     return torch.matmul(x.unflatten(-1, (d // block_r, block_r)), R).flatten(-2)
 
 
@@ -727,13 +683,10 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
-    # Hadamard-rotate Q and K (head_dim) before quantizing: QK-preserving, so the
-    # kernel is unchanged, but the rotated tensors quantize to fp8 more accurately.
-    # Uses the fp8-specific matrix/support check (separate from sage_v2).
+    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
     R = FP8_HADAMARD_MATRIX[query.device]
-    if R is not None:
-        query = _fp8_hadamard_rotate(query, R).contiguous()
-        key = _fp8_hadamard_rotate(key, R).contiguous()
+    query = _fp8_hadamard_rotate(query, R).contiguous()
+    key = _fp8_hadamard_rotate(key, R).contiguous()
 
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
@@ -1182,22 +1135,15 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
 
 
 def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
-    """Per-tensor fp8 (E4M3) quantization of Q, K and V for the all-fp8 sparse
-    ASM path. Mirrors the dense AITER_FP8 quantization exactly: a dynamic
-    ``aiter.per_tensor_quant`` (scale=None -> amax/fp8_max, i.e. full fp8 range)
-    already returns fp32 [1] descales, so the descales are used as-is -- no
-    explicit ``.to(torch.float32)`` casts or ``dim()==0`` reshapes (those were
-    redundant and only added upcast nodes to the traced graph)."""
+    """Per-tensor fp8 (E4M3) quantization of Q, K, V for the all-fp8 sparse path.
+    Mirrors the dense AITER_FP8 quant: dynamic per_tensor_quant already returns
+    fp32 [1] descales, so they're used as-is (no extra casts/reshapes)."""
     quant_dtype = aiter.dtypes.fp8
     dtype_max = torch.finfo(quant_dtype).max
-    # Hadamard-rotate Q and K (head_dim) before quantizing -- QK-preserving, so
-    # the ASM kernel is unchanged, but the rotated tensors quantize more
-    # accurately. Same rotation as the dense AITER_FP8 path (shared fp8-specific
-    # matrix/support check, separate from sage_v2). V is not rotated.
+    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged); V not rotated.
     R = FP8_HADAMARD_MATRIX[q_bshd.device]
-    if R is not None:
-        q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
-        k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
+    q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
+    k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
     q_fp8, q_descale = aiter.per_tensor_quant(
         q_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
