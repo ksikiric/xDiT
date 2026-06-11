@@ -78,6 +78,80 @@ def _aiter_sage_v2_hadamard_matrix(block_r):
         hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
     return hadamard_matrix
 
+
+def _build_hadamard_matrix(block_r, dtype=torch.bfloat16):
+    """Normalized (orthonormal) Hadamard matrix of size block_r x block_r.
+
+    Prefers aiter's ``create_hadamard_matrix`` but falls back to a local
+    Sylvester construction, so the fp8 ASM paths do NOT depend on the sage_v2
+    triton modules being importable. ``block_r`` must be a power of two. The
+    result R satisfies ``R @ R.T == I``, so rotating both Q and K by it leaves
+    ``Q @ K.T`` unchanged.
+    """
+    try:
+        try:
+            from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+                create_hadamard_matrix,
+            )
+        except ImportError:
+            from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+                create_hadamard_matrix,
+            )
+        return create_hadamard_matrix(block_r, dtype=dtype) / (block_r ** 0.5)
+    except ImportError:
+        # Local Sylvester construction: H1=[[1]], H2n=[[Hn,Hn],[Hn,-Hn]].
+        assert block_r & (block_r - 1) == 0, "Hadamard block_r must be a power of 2"
+        H = torch.ones((1, 1), dtype=torch.float32)
+        while H.shape[0] < block_r:
+            H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+        return (H / (block_r ** 0.5)).to(dtype)
+
+
+def _check_aiter_fp8_hadamard():
+    """Whether the dense AITER_FP8 / sparse AITER_SPARGE_ASM_FP8 paths can apply
+    the (quant-time, QK-preserving) Hadamard rotation.
+
+    Decoupled from the sage_v2 triton path: the fp8 kernels use a different entry
+    point (``flash_attn_fp8_pertensor_func`` / ``flash_attn_fp8_sparse_pertensor_func``),
+    so support is gated on one of those being importable -- NOT on sage_v2's
+    ``create_hadamard_matrix``. The rotation matrix itself is always buildable
+    via the local Sylvester fallback in ``_build_hadamard_matrix``.
+    """
+    try:
+        from aiter.ops.mha import flash_attn_fp8_pertensor_func  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    try:
+        from aiter.ops.mha import flash_attn_fp8_sparse_pertensor_func  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _aiter_fp8_hadamard_matrix(block_r):
+    """Per-device Hadamard matrix for the fp8 ASM paths (dense + sparse).
+
+    Separate from ``HADAMARD_MATRIX`` (sage_v2): built independently of the
+    sage_v2 modules and gated on the fp8 entry point via ``_check_aiter_fp8_hadamard``.
+    Mirrors ``_aiter_sage_v2_hadamard_matrix``'s per-device dict (value is None
+    when fp8 Hadamard is unsupported) so callers can index by device.
+    """
+    hadamard_matrix = {}
+    _hadamard = (
+        _build_hadamard_matrix(block_r, dtype=torch.bfloat16)
+        if _check_aiter_fp8_hadamard()
+        else None
+    )
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            device = torch.device(f"cuda:{i}")
+            hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
+    else:
+        device = torch.device("cpu")
+        hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
+    return hadamard_matrix
+
 def _get_mla_cache_device_key(device):
     if device.type == "cuda":
         return (device.type, torch.cuda.current_device() if device.index is None else device.index)
@@ -343,6 +417,11 @@ if env_info["has_aiter"]:
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
     AITER_FP8_HAS_DESCALE = _check_aiter_fp8_has_descale()
     HADAMARD_MATRIX = _aiter_sage_v2_hadamard_matrix(AITER_SAGE_V2_BLOCK_R)
+    # fp8 ASM paths (dense + sparse) use their OWN Hadamard matrix + support
+    # check: the fp8 entry points differ from sage_v2's, and the rotation is a
+    # quant-time, QK-preserving step. block_r = 128 = head_dim -> full-head
+    # rotation. None per-device when the fp8 entry point is unavailable.
+    FP8_HADAMARD_MATRIX = _aiter_fp8_hadamard_matrix(128)
     _TRITON_SSTA_BLOCK_SIZE = 128
     
 
@@ -620,6 +699,24 @@ def _flash_attn_4_fp4_call(query, key, value, dropout_p, is_causal, attention_kw
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
 
+def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+    """Orthonormal Hadamard rotation along head_dim (last axis), applied in
+    blocks of ``R.shape[-1]``. ``R`` is the normalized Hadamard matrix
+    (``R @ R.T == I``), so rotating BOTH Q and K by ``R`` leaves ``Q @ K.T``
+    mathematically unchanged -- the ASM kernel sees identical scores -- while
+    spreading per-channel outliers, which lowers the per-tensor fp8
+    quantization error. Only this QK-preserving rotation is applied (no
+    K-mean smoothing: that needs a score correction the ASM kernel can't take).
+    """
+    d = x.shape[-1]
+    block_r = R.shape[-1]
+    R = R.to(x.dtype)
+    if block_r == d:
+        return torch.matmul(x, R)
+    # block-diagonal rotation: head_dim split into d//block_r chunks of block_r
+    return torch.matmul(x.unflatten(-1, (d // block_r, block_r)), R).flatten(-2)
+
+
 @register_attention_function(AttentionBackendType.AITER_FP8)
 def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
@@ -629,6 +726,14 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # Hadamard-rotate Q and K (head_dim) before quantizing: QK-preserving, so the
+    # kernel is unchanged, but the rotated tensors quantize to fp8 more accurately.
+    # Uses the fp8-specific matrix/support check (separate from sage_v2).
+    R = FP8_HADAMARD_MATRIX[query.device]
+    if R is not None:
+        query = _fp8_hadamard_rotate(query, R).contiguous()
+        key = _fp8_hadamard_rotate(key, R).contiguous()
 
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
@@ -1077,28 +1182,32 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
 
 
 def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
-    """Per-tensor fp8 (e4m3) quantization of Q, K and V (all-fp8 ASM path)."""
+    """Per-tensor fp8 (E4M3) quantization of Q, K and V for the all-fp8 sparse
+    ASM path. Mirrors the dense AITER_FP8 quantization exactly: a dynamic
+    ``aiter.per_tensor_quant`` (scale=None -> amax/fp8_max, i.e. full fp8 range)
+    already returns fp32 [1] descales, so the descales are used as-is -- no
+    explicit ``.to(torch.float32)`` casts or ``dim()==0`` reshapes (those were
+    redundant and only added upcast nodes to the traced graph)."""
     quant_dtype = aiter.dtypes.fp8
     dtype_max = torch.finfo(quant_dtype).max
+    # Hadamard-rotate Q and K (head_dim) before quantizing -- QK-preserving, so
+    # the ASM kernel is unchanged, but the rotated tensors quantize more
+    # accurately. Same rotation as the dense AITER_FP8 path (shared fp8-specific
+    # matrix/support check, separate from sage_v2). V is not rotated.
+    R = FP8_HADAMARD_MATRIX[q_bshd.device]
+    if R is not None:
+        q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
+        k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
     q_fp8, q_descale = aiter.per_tensor_quant(
-        q_bshd, scale=torch.abs(q_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        q_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
     k_fp8, k_descale = aiter.per_tensor_quant(
-        k_bshd, scale=torch.abs(k_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        k_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
     v_fp8, v_descale = aiter.per_tensor_quant(
-        v_bshd, scale=torch.abs(v_bshd).max(), quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        v_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
     )
-    if q_descale.dim() == 0:
-        q_descale = q_descale.reshape(1)
-    if k_descale.dim() == 0:
-        k_descale = k_descale.reshape(1)
-    if v_descale.dim() == 0:
-        v_descale = v_descale.reshape(1)
-    return (
-        q_fp8, k_fp8, v_fp8,
-        q_descale.to(torch.float32), k_descale.to(torch.float32), v_descale.to(torch.float32),
-    )
+    return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
 
 
 @register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_FP8)
