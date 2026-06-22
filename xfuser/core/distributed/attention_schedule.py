@@ -1,8 +1,16 @@
-from typing import Callable, List, Optional, Type, TypeVar
+from typing import Callable, List, Optional, Type, TypeVar, FrozenSet
 
 from xfuser.core.distributed.attention_backend import AttentionBackendType, env_info
 
 T = TypeVar("T", bound="AttentionSchedule")
+G = TypeVar("G", bound="GemmPrecisionSchedule")
+
+_GEMM_HIGH_SYNONYMS: FrozenSet[str] = frozenset(
+    {"FP8", "TRUE", "1", "HIGH", "HP", "YES"}
+)
+_GEMM_LOW_SYNONYMS: FrozenSet[str] = frozenset(
+    {"FP4", "MXFP4", "NVFP4", "FALSE", "0", "LOW", "LP", "NO"}
+)
 
 
 class AttentionSchedule:
@@ -87,6 +95,39 @@ class GemmPrecisionSchedule:
         if not use_high_precision_schedule:
             raise ValueError("GemmPrecisionSchedule requires at least one step.")
         self.use_high_precision_schedule = list(use_high_precision_schedule)
+
+    @property
+    def total_steps(self) -> int:
+        return len(self.use_high_precision_schedule)
+
+    @classmethod
+    def from_comma_delimited_string(cls: Type[G], s: str) -> G:
+        """
+        Build a schedule from comma-separated tokens (case-insensitive).
+
+        High-precision (FP8 GEMM path in hybrid layers): FP8, TRUE, 1, HIGH, HP, YES
+        Low-precision (FP4 / MXFP4 path): FP4, MXFP4, NVFP4, FALSE, 0, LOW, LP, NO
+
+        Example: ``fp4,fp4,fp8,fp8`` — asymmetric schedules are allowed; length must
+        match ``num_inference_steps * cfg_step_multiplier`` at runtime (same as hybrid attention).
+        """
+        if not s or not s.strip():
+            raise ValueError("Comma-delimited GEMM schedule must contain at least one token.")
+        schedule: List[bool] = []
+        for token in s.split(","):
+            name = token.strip().upper()
+            if not name:
+                raise ValueError("Empty token in comma-delimited GEMM schedule string.")
+            if name in _GEMM_HIGH_SYNONYMS:
+                schedule.append(True)
+            elif name in _GEMM_LOW_SYNONYMS:
+                schedule.append(False)
+            else:
+                raise ValueError(
+                    f"Unknown GEMM schedule token {token.strip()!r}. "
+                    "Use FP8 or FP4 (synonyms: TRUE/FALSE, 1/0, HIGH/LOW, HP/LP, YES/NO)."
+                ) from None
+        return cls(schedule)
 
     def is_high_precision(self, step: int) -> bool:
         if step < 0 or step >= len(self.use_high_precision_schedule):

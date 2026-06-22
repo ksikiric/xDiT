@@ -161,6 +161,7 @@ class xFuserArgs:
     # Hybrid GEMM schedule (FP8 high precision + FP4 low precision)
     use_hybrid_gemm_schedule: bool = False
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
+    hybrid_gemm_schedule: Optional[str] = None
     # SSTA arguments
     use_ssta_sparse_text_to_image: Optional[bool] = False
     # Sparge attention
@@ -708,13 +709,28 @@ class xFuserArgs:
             "--use_hybrid_gemm_schedule",
             action="store_true",
             default=False,
-            help="Enable hybrid GEMM schedule: FP8 at start/end and MXFP4 in the middle.",
+            help=(
+                "Enable hybrid GEMM schedule: FP8 vs FP4 per step. Use "
+                "--num_hybrid_gemm_high_precision_steps for symmetric FP8 at start/end, or "
+                "--hybrid_gemm_schedule for an explicit comma-separated list."
+            ),
         )
         parser.add_argument(
             "--num_hybrid_gemm_high_precision_steps",
             type=int,
             default=None,
             help="Number of high-precision GEMM steps at both the start and end of denoising.",
+        )
+        parser.add_argument(
+            "--hybrid_gemm_schedule",
+            type=str,
+            default=None,
+            help=(
+                "Explicit comma-delimited GEMM precision per scheduled step (FP8 vs FP4), "
+                "same length as hybrid attention schedules: num_inference_steps times the CFG "
+                "multiplier (2 when guidance_scale>1). Tokens: FP8/fp8 or FP4/fp4 (synonyms: "
+                "TRUE/FALSE, 1/0, HIGH/LOW). Do not combine with --num_hybrid_gemm_high_precision_steps."
+            ),
         )
         parser.add_argument(
             "--use_vae_channels_last_format",
@@ -829,6 +845,21 @@ class xFuserArgs:
         if self.use_hybrid_gemm_schedule:
             if not self.use_fp4_gemms:
                 raise ValueError("When use_hybrid_gemm_schedule is True, use_fp4_gemms must be set.")
+            if self.hybrid_gemm_schedule is not None:
+                if self.num_hybrid_gemm_high_precision_steps is not None:
+                    raise ValueError(
+                        "When hybrid_gemm_schedule is set, omit num_hybrid_gemm_high_precision_steps; "
+                        "the string defines the full per-step schedule."
+                    )
+                from xfuser.core.distributed.attention_schedule import GemmPrecisionSchedule
+
+                GemmPrecisionSchedule.from_comma_delimited_string(self.hybrid_gemm_schedule)
+            elif self.num_hybrid_gemm_high_precision_steps is None:
+                raise ValueError(
+                    "When use_hybrid_gemm_schedule is True, set either hybrid_gemm_schedule "
+                    "(comma-delimited FP8/FP4 per step) or num_hybrid_gemm_high_precision_steps "
+                    "(symmetric FP8 at start and end)."
+                )
 
         model_config = ModelConfig(
             model=self.model,

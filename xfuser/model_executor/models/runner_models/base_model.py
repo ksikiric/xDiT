@@ -43,7 +43,12 @@ from xfuser.core.distributed import (
     shard_component,
 )
 from xfuser.core.distributed.attention_backend import AttentionBackendType
-from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
+from xfuser.core.distributed.attention_schedule import (
+    AttentionSchedule,
+    GemmPrecisionSchedule,
+    create_hybrid_attn_schedule,
+    create_hybrid_gemm_schedule,
+)
 
 
 packages_info = PACKAGES_CHECKER.get_packages_info()
@@ -763,21 +768,39 @@ class xFuserModel(abc.ABC):
 
     def _setup_hybrid_gemm_schedule(self, input_args: dict) -> None:
         """
-        Setup hybrid GEMM schedule: high precision FP8 GEMMs at start/end, MXFP4 GEMMs in the middle.
+        Setup hybrid GEMM schedule: either symmetric FP8 at start/end (N denoising steps each side),
+        or an explicit comma-delimited FP8/FP4 schedule (same total length as hybrid attention).
         """
-        if input_args["num_hybrid_gemm_high_precision_steps"] is None:
-            raise ValueError("You must provide 'num_hybrid_gemm_high_precision_steps' to use the hybrid GEMM schedule.")
         multiplier = self._calculate_hybrid_attention_step_multiplier(input_args)
         total_steps = input_args["num_inference_steps"] * multiplier
-        num_high_precision_steps = input_args["num_hybrid_gemm_high_precision_steps"] * multiplier
 
-        gemm_schedule = create_hybrid_gemm_schedule(
-            num_high_precision_steps=num_high_precision_steps,
-            total_steps=total_steps,
-        )
+        if self.config.hybrid_gemm_schedule is not None:
+            gemm_schedule = GemmPrecisionSchedule.from_comma_delimited_string(
+                self.config.hybrid_gemm_schedule
+            )
+            if gemm_schedule.total_steps != total_steps:
+                raise ValueError(
+                    f"Hybrid GEMM schedule length {gemm_schedule.total_steps} does not match "
+                    f"expected steps {total_steps} (num_inference_steps={input_args['num_inference_steps']}, "
+                    f"multiplier={multiplier})."
+                )
+        else:
+            if input_args["num_hybrid_gemm_high_precision_steps"] is None:
+                raise ValueError(
+                    "Provide 'num_hybrid_gemm_high_precision_steps' or set config.hybrid_gemm_schedule "
+                    "for hybrid GEMM scheduling."
+                )
+            num_high_precision_steps = input_args["num_hybrid_gemm_high_precision_steps"] * multiplier
+            gemm_schedule = create_hybrid_gemm_schedule(
+                num_high_precision_steps=num_high_precision_steps,
+                total_steps=total_steps,
+            )
 
         log("Enabling hybrid GEMM schedule")
-        log(f"Hybrid GEMM schedule (high precision=True): {gemm_schedule.use_high_precision_schedule}", debug=True)
+        log(
+            f"Hybrid GEMM schedule (True=FP8 GEMM, False=FP4): {gemm_schedule.use_high_precision_schedule}",
+            debug=True,
+        )
         get_runtime_state().set_gemm_schedule(gemm_schedule, total_steps=total_steps)
 
     def _convert_vae_to_channels_last(self) -> None:

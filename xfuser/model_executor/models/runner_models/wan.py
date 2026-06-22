@@ -529,6 +529,40 @@ class xFuserWan21T2VModel(xFuserModel):
 @register_model("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
 @register_model("Wan2.2-T2V")
 class xFuserWan22T2VModel(xFuserWan21T2VModel):
+    """Wan 2.2 T2V dual-transformer model: same as 2.1 T2V plus ``transformer_2``.
+
+    Both backbones can use MXFP4 (``--use_fp4_gemms``) with optional per-step FP8
+    via ``--use_hybrid_gemm_schedule`` and ``--num_hybrid_gemm_high_precision_steps``
+    (mirrors Wan 2.2 TI2V). ``fp4_gemm_module_list`` includes ``transformer_2.blocks``
+    so the low-noise expert is not left FP8-only when FP4 is requested.
+    """
+
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
+        use_fp4_gemms=True,
+        use_hybrid_attn_schedule=True,
+        use_hybrid_gemm_schedule=True,
+        use_parallel_vae=True,
+        cross_attention_backend=True,
+        supports_sparge_attention_backends=True,
+        enable_tiling=True,
+        enable_slicing=True,
+    )
+    default_input_values = DefaultInputValues(
+        height=720,
+        width=1280,
+        num_inference_steps=40,
+        num_frames=81,
+        negative_prompt="bright colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still picture, cluttered background, three legs, many people in the background, walking backwards",
+        guidance_scale=3.5,
+        guidance_scale_2=None,
+        flow_shift=12,
+        num_hybrid_attn_high_precision_steps=5,
+        num_hybrid_gemm_high_precision_steps=5,
+    )
 
     def __init__(self, config: xFuserArgs) -> None:
         super().__init__(config)
@@ -539,6 +573,7 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
                 "dtype": torch.bfloat16,
         }
         self.settings.fp8_gemm_module_list=["transformer.blocks", "transformer_2.blocks"]
+        self.settings.fp4_gemm_module_list=["transformer.blocks", "transformer_2.blocks"]
         self.settings.fp8_precision_overrides=None
 
     def _load_model(self) -> DiffusionPipeline:

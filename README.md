@@ -292,6 +292,9 @@ Flag	Description
 `--hybrid_attn_high_precision_backend`	Backend for the first/last N steps (e.g. aiter)
 `--hybrid_attn_low_precision_backend`	Backend for the remaining steps (e.g. aiter_fp8)
 `--num_hybrid_attn_high_precision_steps`	Number of steps N at the start and end that use high precision
+`--hybrid_attn_schedule`	Optional explicit comma-separated backend names per step (same length as scheduled diffusion steps; do not set the low/high backend flags when using this)
+
+Hybrid GEMM scheduling (`--use_hybrid_gemm_schedule` with `--use_fp4_gemms`) supports either symmetric FP8 at the start and end via `--num_hybrid_gemm_high_precision_steps`, or an arbitrary per-step list via `--hybrid_gemm_schedule` using comma-separated tokens such as `fp4` and `fp8` (same step-count rules as hybrid attention, including CFG doubling when `guidance_scale` > 1).
 
 AITER now supports Sage (FP8) and Sage v2 (MXFP4, GFX950 only) for improved quality when doing quantized attention. Sage v2 is still recommended to be combined with hybrid attention, using either AITER Sage or just AITER as the high precision backend.
 
