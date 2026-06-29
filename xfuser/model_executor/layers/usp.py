@@ -38,6 +38,9 @@ from xfuser.core.sparge_attention.head_balance import (
 # excluded so head balancing is a clean no-op for them.
 _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
+    AttentionBackendType.AITER_SPARGE_ASM,
+    AttentionBackendType.AITER_SPARGE_ASM_V2,
+    AttentionBackendType.AITER_SPARGE_ASM_FP8,
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
 })
