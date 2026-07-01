@@ -1257,8 +1257,8 @@ def _asm_sparge_fp8_quantize(
     q_bshd: torch.Tensor,
     k_bshd: torch.Tensor,
     v_bshd: torch.Tensor,
-    attention_kwargs: dict = None
-):
+    attention_kwargs: Optional[dict] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 (E4M3) quantization of Q, K, V for the all-fp8 sparse path.
     Mirrors the dense AITER_FP8 quant: dynamic per_tensor_quant already returns
     fp32 [1] descales, so they're used as-is (no extra casts/reshapes)."""
@@ -1266,7 +1266,7 @@ def _asm_sparge_fp8_quantize(
     pre_quantized = attention_kwargs.get("pre_quantized", False)
 
     if pre_quantized:
-        q_fp8, k_fp8, v_fp8 = q_bshd, k_bshd, v_bshd,
+        q_fp8, k_fp8, v_fp8 = q_bshd, k_bshd, v_bshd
         q_descale, k_descale, v_descale = attention_kwargs["q_descale"], attention_kwargs["k_descale"], attention_kwargs["v_descale"]
     else:
         quant_dtype = aiter.dtypes.fp8
