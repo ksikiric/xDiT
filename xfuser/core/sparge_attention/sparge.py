@@ -280,12 +280,15 @@ def compute_sparge_block_mask(
     text_len: int = 0,
     block_m: int = 128,
     block_n: int = 128,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     image_q = q[:, :, :q.shape[2] - text_len, :] if text_len > 0 else q
     image_k = k[:, :, :k.shape[2] - text_len, :] if text_len > 0 else k
 
     image_block_mask = get_block_map_meansim(
         image_q, image_k,
+        q_descale=q_descale, k_descale=k_descale,
         is_causal=is_causal,
         BLKQ=block_m, BLKK=block_n,
         simthreshd1=simthreshd1, cdfthreshd=cdfthreshd,

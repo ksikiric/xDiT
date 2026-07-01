@@ -48,7 +48,11 @@ _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
 })
-
+_ATTENTION_BACKENDS_SUPPORTING_PRE_HADAMARD_ROTATION = frozenset({
+    AttentionBackendType.AITER_FP8,
+    AttentionBackendType.AITER_SPARGE_ASM_FP8,
+    AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
+})
 _FP8_LOG_SCALES = bool(os.environ.get("XFUSER_FP8_LOG_SCALES"))
 _FP8_NCCL_NEEDS_VIEW = parse(torch.__version__).release < parse("2.11.0").release
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
@@ -376,7 +380,7 @@ def USP(
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_comms:
             fp8_comms_backend = backend if backend is not None else get_runtime_state().attention_backend
-            if fp8_comms_backend == AttentionBackendType.AITER_FP8:
+            if fp8_comms_backend in _ATTENTION_BACKENDS_SUPPORTING_PRE_HADAMARD_ROTATION:
                 from xfuser.core.distributed.attention_backend import (
                     FP8_HADAMARD_MATRIX,
                     _fp8_hadamard_rotate,

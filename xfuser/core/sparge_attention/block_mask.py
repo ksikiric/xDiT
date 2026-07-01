@@ -15,6 +15,8 @@
 #   This file has been modified from the upstream Apache-2.0 source at
 #   https://github.com/thu-ml/SpargeAttn (spas_sage_attn/utils.py).
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -67,6 +69,7 @@ def hyperparameter_check(
 @triton.jit
 def triton_bmm_pool_sim_simmean(
     x_ptr,
+    descale_ptr,
     pool_ptr,
     sim_ptr,
     simthreshd1_ptr,
@@ -82,17 +85,18 @@ def triton_bmm_pool_sim_simmean(
     x_ptrs = x_ptr + block_offset + tl.arange(0, BS)[:, None] * D + tl.arange(0, D)[None, :]
     # Load the input block, xmask will return nan for out-of-bound elements
     x = tl.load(x_ptrs, mask = xmask)
+    descale = tl.load(descale_ptr)
     BS_ = BS if (N - nb*BS) >= BS else (N - nb*BS)
 
     cur_h1 = tl.load(simthreshd1_ptr + h)
     x_fp32 = x.to(tl.float32)
     # Check for NaN values
     is_nan = x_fp32 != x_fp32
-    x_fp32 = tl.where(is_nan, 0.0, x_fp32)
+    x_fp32 = tl.where(is_nan, 0.0, x_fp32 * descale)
 
-    pool = (tl.sum(x_fp32, axis=0) / BS_)
+    pool = (tl.sum(x_fp32, axis=0) / BS_).to(dtype=pool_ptr.dtype.element_ty)
     x_norm = tl.sqrt(tl.sum(x_fp32 * x_fp32, axis=1, keep_dims=True))
-    x = (x / x_norm).to(tl.float16)  # norm at D dim
+    x = (x_fp32 / x_norm).to(dtype=pool_ptr.dtype.element_ty)  # norm at D dim
     # Check for NaN values after normalization
     is_nan = x != x
     x = tl.where(is_nan, 0.0, x)
@@ -108,7 +112,7 @@ def triton_bmm_pool_sim_simmean(
 
 
 def get_pool_sim_triton_simmean(
-    x, block_size, simthreshd1
+    x, descale, block_size, simthreshd1, dtype: torch.dtype = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
@@ -128,14 +132,15 @@ def get_pool_sim_triton_simmean(
     pool: (B, H, nblock, D) tensor
     sim_blocks: (B, H, nblock) bool tensor
     """
+    dtype = x.dtype if dtype is None else dtype
     x = x.contiguous()
     B, H, N, D = x.shape
     nblock = (N + block_size - 1) // block_size  # Number of blocks per feature map
-    pool = torch.empty((B, H, nblock, D), device=x.device, dtype=x.dtype)
+    pool = torch.empty((B, H, nblock, D), device=x.device, dtype=dtype)
     sim_blocks = torch.empty((B, H, nblock), device=x.device, dtype=torch.bool)
     grid = (B, H, nblock)
     # Launch kernel
-    triton_bmm_pool_sim_simmean[grid](x, pool, sim_blocks, simthreshd1, N=N, D=D, BS=block_size)
+    triton_bmm_pool_sim_simmean[grid](x, descale,pool, sim_blocks, simthreshd1, N=N, D=D, BS=block_size)
     return pool, sim_blocks
 
 
@@ -181,24 +186,38 @@ def fill_block_map_triton(final_map, num_to_select, sorted_indices):
 def get_block_map_meansim(
     q: torch.Tensor,
     k: torch.Tensor,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
     is_causal: bool = False,
     BLKQ: int = 64,
     BLKK: int = 64,
     simthreshd1: float = 0.1,
     cdfthreshd: float = 0.9,
-    attention_sink: bool = False
+    attention_sink: bool = False,
+    dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     Headnum = q.size(1)
     simthreshd1 = hyperparameter_check(simthreshd1, Headnum, q.device)
     cdfthreshd = hyperparameter_check(cdfthreshd, Headnum, q.device)
     nq = (q.shape[-2] + BLKQ - 1) // BLKQ
     nk = (k.shape[-2] + BLKK - 1) // BLKK
-    pooled_qblocks, sim_qblocks = get_pool_sim_triton_simmean(q, BLKQ, simthreshd1)
-    pooled_kblocks, sim_kblocks = get_pool_sim_triton_simmean(k, BLKK, simthreshd1)
+
+    if q_descale is None:
+        q_descale = torch.tensor(1.0, device=q.device, dtype=dtype)
+    if k_descale is None:
+        k_descale = torch.tensor(1.0, device=k.device, dtype=dtype)
+
+    pooled_qblocks, sim_qblocks = get_pool_sim_triton_simmean(q, q_descale, BLKQ, simthreshd1, dtype=dtype)
+    pooled_kblocks, sim_kblocks = get_pool_sim_triton_simmean(k, k_descale, BLKK, simthreshd1, dtype=dtype)
 
     sim_kblocks = sim_kblocks.unsqueeze(-2).expand(-1, -1, nq, -1)  # faster than repeat
     sim_qblocks = sim_qblocks.unsqueeze(-1).expand(-1, -1, -1, nk)
-    pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2) * q.shape[-1] ** -0.5
+    scale = q.shape[-1] ** -0.5
+    pooled_score = (
+        pooled_qblocks.to(dtype=torch.float32) @
+        pooled_kblocks.transpose(-1, -2).to(dtype=torch.float32) *
+        scale
+    ).to(dtype=dtype)
 
     neg_inf = pooled_score.new_full((), float("-inf"))
     pooled_score = torch.where(sim_kblocks, pooled_score, neg_inf)
