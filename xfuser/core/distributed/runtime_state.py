@@ -55,6 +55,7 @@ from xfuser.config.args import xFuserArgs
 logger = init_logger(__name__)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
+_FP8_COMMS_SAFETY_FACTOR = 0.85
 
 
 def set_random_seed(seed: int):
@@ -73,12 +74,14 @@ class Fp8CommsModelState:
         self.q_running_max = torch.zeros(num_layers, dtype=torch.float32)
         self.k_running_max = torch.zeros(num_layers, dtype=torch.float32)
         self.v_running_max = torch.zeros(num_layers, dtype=torch.float32)
+        self.o_running_max = torch.zeros(num_layers, dtype=torch.float32)
         self.synced = False
 
     def to_device_(self, device: torch.device):
         self.q_running_max = self.q_running_max.to(device)
         self.k_running_max = self.k_running_max.to(device)
         self.v_running_max = self.v_running_max.to(device)
+        self.o_running_max = self.o_running_max.to(device)
 
 
 class Fp8CommsState:
@@ -113,6 +116,7 @@ class Fp8CommsState:
             block.attn1.fp8_q_scale.fill_(scale)
             block.attn1.fp8_k_scale.fill_(scale)
             block.attn1.fp8_v_scale.fill_(scale)
+            block.attn1.fp8_o_scale.fill_(scale)
 
     def update_running_max(
         self,
@@ -146,11 +150,36 @@ class Fp8CommsState:
             torch.maximum(model_state.v_running_max.index_select(0, idx), v_amax),
         )
 
-    def _scatter_scales_to_model(self, model, q_scales: torch.Tensor, k_scales: torch.Tensor, v_scales: torch.Tensor):
+    def update_o_running_max(
+        self,
+        model,
+        layer_idx: torch.Tensor,
+        o_descale: torch.Tensor,
+    ):
+        """Update o running amaxes in-place for one layer. Safe inside compiled region when unsynced."""
+        model_state = self._models.get(id(model))
+        if model_state is None or model_state.synced:
+            return
+        idx = layer_idx.reshape(-1).long()
+        model_state.o_running_max.index_copy_(
+            0,
+            idx,
+            torch.maximum(model_state.o_running_max.index_select(0, idx), o_descale),
+        )
+
+    def _scatter_scales_to_model(
+        self,
+        model,
+        q_scales: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        o_scales: torch.Tensor,
+    ):
         for i, block in enumerate(model.blocks):
             block.attn1.fp8_q_scale.copy_(q_scales[i : i + 1])
             block.attn1.fp8_k_scale.copy_(k_scales[i : i + 1])
             block.attn1.fp8_v_scale.copy_(v_scales[i : i + 1])
+            block.attn1.fp8_o_scale.copy_(o_scales[i : i + 1])
 
     def to_device_(self, device: torch.device):
         for model_state in self._models.values():
@@ -271,29 +300,35 @@ class RuntimeState(metaclass=ABCMeta):
         ):
             return
         from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
-        _FP8_COMMS_SAFETY_FACTOR = 0.85
         dtype_max = torch.finfo(AITER_FP8_DTYPE).max
         maxes = torch.stack(
-            [model_state.q_running_max, model_state.k_running_max, model_state.v_running_max],
+            [
+                model_state.q_running_max,
+                model_state.k_running_max,
+                model_state.v_running_max,
+                model_state.o_running_max
+            ],
             dim=0,
         )
         dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
         scales = maxes.clamp(min=1e-6) / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
-        fp8_comms._scatter_scales_to_model(model, scales[0], scales[1], scales[2])
+        fp8_comms._scatter_scales_to_model(model, scales[0], scales[1], scales[2], scales[3])
         model_state.q_running_max.zero_()
         model_state.k_running_max.zero_()
         model_state.v_running_max.zero_()
+        model_state.o_running_max.zero_()
         model_state.synced = True
         fp8_comms.calibrated_model_ids.add(id(model))
         if dist.get_rank() == 0:
-            q_scales, k_scales, v_scales = scales[0], scales[1], scales[2]
+            q_scales, k_scales, v_scales, o_scales = scales[0], scales[1], scales[2], scales[3]
             print(
                 f"[fp8_comms] {model.__class__.__name__} per-layer scales synced: "
                 f"q=[{q_scales.min().item():.6f}, {q_scales.max().item():.6f}] "
                 f"k=[{k_scales.min().item():.6f}, {k_scales.max().item():.6f}] "
                 f"v=[{v_scales.min().item():.6f}, {v_scales.max().item():.6f}] "
+                f"o=[{o_scales.min().item():.6f}, {o_scales.max().item():.6f}] "
                 f"(amax q={maxes[0].max().item():.4f} k={maxes[1].max().item():.4f} "
-                f"v={maxes[2].max().item():.4f})"
+                f"v={maxes[2].max().item():.4f} o={maxes[3].max().item():.4f})"
             )
 
     def reset_fp8_comms_calibration(self, model=None):
@@ -311,9 +346,11 @@ class RuntimeState(metaclass=ABCMeta):
             block.attn1.fp8_q_scale.fill_(1.0)
             block.attn1.fp8_k_scale.fill_(1.0)
             block.attn1.fp8_v_scale.fill_(1.0)
+            block.attn1.fp8_o_scale.fill_(1.0)
         model_state.q_running_max.zero_()
         model_state.k_running_max.zero_()
         model_state.v_running_max.zero_()
+        model_state.o_running_max.zero_()
         model_state.synced = False
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):

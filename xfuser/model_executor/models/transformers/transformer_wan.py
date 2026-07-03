@@ -131,6 +131,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         )
 
         # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
+        fp8_comms_synced = False
         if not self.is_cross_attention and runtime_state.fp8_comms is not None:
             fp8_owner = getattr(attn, "fp8_comms_owner", None)
             if fp8_owner is not None and hasattr(attn, "fp8_comms_layer_idx"):
@@ -141,15 +142,19 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                     key,
                     value,
                 )
+                fp8_comms_synced = runtime_state.fp8_comms.get_model_state(fp8_owner).synced
 
         fp8_q_scale = getattr(attn, "fp8_q_scale", None)
         fp8_k_scale = getattr(attn, "fp8_k_scale", None)
         fp8_v_scale = getattr(attn, "fp8_v_scale", None)
+        fp8_o_scale = getattr(attn, "fp8_o_scale", None)
         fp8_kwargs = (
             {
                 "fp8_q_scale": fp8_q_scale,
                 "fp8_k_scale": fp8_k_scale,
                 "fp8_v_scale": fp8_v_scale,
+                "fp8_o_scale": fp8_o_scale,
+                "fp8_comms_synced": fp8_comms_synced,
             }
             if use_fp8_comms
             else {}
@@ -185,8 +190,22 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
             **fp8_kwargs,
-        ).transpose(1, 2)
+        )
 
+        if use_fp8_comms:
+            hidden_states, out_amax = hidden_states
+
+        # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
+        if not self.is_cross_attention and runtime_state.fp8_comms is not None:
+            fp8_owner = getattr(attn, "fp8_comms_owner", None)
+            if fp8_owner is not None and hasattr(attn, "fp8_comms_layer_idx"):
+                runtime_state.fp8_comms.update_o_running_max(
+                    fp8_owner,
+                    attn.fp8_comms_layer_idx,
+                    out_amax,
+                )
+
+        hidden_states = hidden_states.transpose(1, 2)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(activation_dtype)
 
@@ -261,6 +280,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             )
             block.attn1.register_buffer(
                 "fp8_v_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_o_scale", torch.zeros(1, dtype=torch.float32), persistent=False
             )
             block.attn1.register_buffer(
                 "fp8_comms_layer_idx",
