@@ -143,6 +143,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                     value,
                 )
                 fp8_comms_synced = runtime_state.fp8_comms.get_model_state(fp8_owner).synced
+        use_fp8_comms = use_fp8_comms and fp8_comms_synced
 
         fp8_q_scale = getattr(attn, "fp8_q_scale", None)
         fp8_k_scale = getattr(attn, "fp8_k_scale", None)
@@ -154,7 +155,6 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 "fp8_k_scale": fp8_k_scale,
                 "fp8_v_scale": fp8_v_scale,
                 "fp8_o_scale": fp8_o_scale,
-                "fp8_comms_synced": fp8_comms_synced,
             }
             if use_fp8_comms
             else {}
@@ -190,10 +190,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
             **fp8_kwargs,
-        )
-
-        if use_fp8_comms:
-            hidden_states, out_amax = hidden_states
+        ).transpose(1, 2)
 
         # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
         if not self.is_cross_attention and runtime_state.fp8_comms is not None:
@@ -202,10 +199,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 runtime_state.fp8_comms.update_o_running_max(
                     fp8_owner,
                     attn.fp8_comms_layer_idx,
-                    out_amax,
+                    hidden_states,
                 )
 
-        hidden_states = hidden_states.transpose(1, 2)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(activation_dtype)
 

@@ -171,7 +171,7 @@ def _fp8_comms_output_all_to_all(out: torch.Tensor, o_scale_t: torch.Tensor | No
         out_fp8, out_descale = _per_tensor_quant(out, o_scale_t)
     else:
         out_fp8, out_descale = out, o_scale_t
-    return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(restore_dtype), out_descale
+    return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(restore_dtype)
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -450,13 +450,11 @@ def USP(
                 rank = dist.get_rank()
                 q_amax, k_amax, v_amax = qkv_amaxes
                 print(f"[fp8_scales rank{rank}] q_amax={q_amax:.4f} k_amax={k_amax:.4f} v_amax={v_amax:.4f} out_amax={out_amax:.4f}")
-            if fp8_comms_synced:
-                out_scale_t = fp8_o_scale
-            else:
-                out_scale_t = torch.maximum(fp8_o_scale, out_amax / (dtype_max * _FP8_COMMS_SAFETY_FACTOR))
-                dist.all_reduce(out_scale_t, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-            out, out_descale = _fp8_comms_output_all_to_all(out, out_scale_t)
-            out_amax = (dtype_max * _FP8_COMMS_SAFETY_FACTOR) * out_descale
+            if fp8_o_scale is None:
+                raise RuntimeError(
+                    "FP8 comms requires per-layer scale buffers fp8_o_scale"
+                )
+            out = _fp8_comms_output_all_to_all(out, fp8_o_scale)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
@@ -465,8 +463,7 @@ def USP(
             out = revert_head_balance(
                 out, attention_kwargs, head_balance_layer, hb_uly
             )
-        if use_fp8_comms:
-            out = out, out_amax
+
     return out
 
 

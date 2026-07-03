@@ -161,10 +161,11 @@ class Fp8CommsState:
         if model_state is None or model_state.synced:
             return
         idx = layer_idx.reshape(-1).long()
+        o_amax = o_descale.abs().amax().reshape(1)
         model_state.o_running_max.index_copy_(
             0,
             idx,
-            torch.maximum(model_state.o_running_max.index_select(0, idx), o_descale),
+            torch.maximum(model_state.o_running_max.index_select(0, idx), o_amax),
         )
 
     def _scatter_scales_to_model(
