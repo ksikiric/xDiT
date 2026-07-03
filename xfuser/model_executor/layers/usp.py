@@ -22,6 +22,7 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_rank,
     get_runtime_state,
 )
+from xfuser.core.distributed.runtime_state import _FP8_COMMS_SAFETY_FACTOR
 
 from packaging.version import parse
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
