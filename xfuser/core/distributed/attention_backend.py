@@ -4,6 +4,7 @@ import inspect
 import math
 import torch.nn.functional as F
 from enum import Enum
+from typing import Optional
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
 from xfuser.core.distributed.ssta import (
     setup_ssta,
