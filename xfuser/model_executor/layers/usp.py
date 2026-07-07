@@ -22,6 +22,7 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_rank,
     get_runtime_state,
 )
+from xfuser.core.distributed.runtime_state import _FP8_COMMS_SAFETY_FACTOR
 
 from packaging.version import parse
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
@@ -167,13 +168,13 @@ def _fp8_comms_input_all_to_all(
     return query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes
 
 
-def _fp8_comms_output_all_to_all(out: torch.Tensor, v_scale_t: torch.Tensor) -> torch.Tensor:
+def _fp8_comms_output_all_to_all(out: torch.Tensor, o_scale_t: torch.Tensor | None) -> torch.Tensor:
     """Quantize attention output to FP8, run output all-to-all, dequantize back."""
     restore_dtype = out.dtype if out.dtype not in _FP8_DTYPES else torch.bfloat16
     if out.dtype not in _FP8_DTYPES:
-        out_fp8, out_descale = _per_tensor_quant(out, v_scale_t)
+        out_fp8, out_descale = _per_tensor_quant(out, o_scale_t)
     else:
-        out_fp8, out_descale = out, v_scale_t
+        out_fp8, out_descale = out, o_scale_t
     return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(restore_dtype)
 
 
@@ -332,6 +333,8 @@ def USP(
         fp8_q_scale: torch.Tensor | None = None,
         fp8_k_scale: torch.Tensor | None = None,
         fp8_v_scale: torch.Tensor | None = None,
+        fp8_o_scale: torch.Tensor | None = None,
+        fp8_comms_synced: bool = False,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -444,13 +447,18 @@ def USP(
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
         if use_fp8_comms:
+            dtype_max = 448.0
+            out_amax = out.abs().amax()
             if _FP8_LOG_SCALES and qkv_amaxes is not None:
-                out_amax = out.abs().amax().item()
+                out_amax = out_amax.item()
                 rank = dist.get_rank()
                 q_amax, k_amax, v_amax = qkv_amaxes
                 print(f"[fp8_scales rank{rank}] q_amax={q_amax:.4f} k_amax={k_amax:.4f} v_amax={v_amax:.4f} out_amax={out_amax:.4f}")
-            _, _, v_scale_t = qkv_scales
-            out = _fp8_comms_output_all_to_all(out, v_scale_t)
+            if fp8_o_scale is None:
+                raise RuntimeError(
+                    "FP8 comms requires per-layer scale buffers fp8_o_scale"
+                )
+            out = _fp8_comms_output_all_to_all(out, fp8_o_scale)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
