@@ -26,6 +26,7 @@ from xfuser.core.utils.runner_utils import (
     quantize_linear_layers_to_fp8,
     quantize_linear_layers_to_fp8_blockscale,
     quantize_linear_layers_to_fp4,
+    quantize_linear_layers_to_fp6,
     quantize_linear_layers_to_nvfp4,
     convert_model_convs_to_channels_last,
     _use_aiter_fp8_rdna4,
@@ -131,6 +132,13 @@ class ModelCapabilities:
     use_fbcache: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
+    # Substitute MXFP6 for FP8 everywhere it would be used: whole FP8 modules (e.g. the
+    # low-noise transformer_2 in Wan2.2 MoE), per-layer FP8 overrides, and streaming FP8
+    # blocks. Accuracy ~= FP8 (cos ~0.999), GEMM ~2.7-3.8x faster, all-MX pipeline with FP4.
+    use_fp6_gemms: bool = False
+    # Pure MXFP6 for ALL transformer GEMMs (both high- and low-noise transformers, all steps):
+    # routes the FP4 module list to FP6 too. For clean fp6-vs-fp8 whole-model comparison.
+    use_fp6_only: bool = False
     cross_attention_backend: bool = False
     supports_sparse_attention_backends: bool = False
     supports_sparge_attention_backends: bool = False
@@ -919,9 +927,12 @@ class xFuserModel(abc.ABC):
                         fp8_suffix_layers=fp8_suffix_overrides,
                         use_hybrid_schedule=self.config.use_hybrid_gemm_schedule,
                         device=device,
+                        use_fp6_for_overrides=self.config.use_fp6_gemms,
                     )
             else:
-                if _use_aiter_fp8_rdna4():
+                if self.config.use_fp6_gemms:
+                    quantize_linear_layers_to_fp6(block, device=device)
+                elif _use_aiter_fp8_rdna4():
                     quantize_linear_layers_to_fp8_blockscale(block, device=device)
                 else:
                     quantize_linear_layers_to_fp8(block, device=device)
@@ -930,28 +941,39 @@ class xFuserModel(abc.ABC):
 
     def _setup_mxfp4_gemms(self, local_rank):
         for module_name in self.settings.fp4_gemm_module_list:
+            module = rgetattr(self.pipe, module_name)
+            if self.config.use_fp6_only:
+                # Pure-FP6 mode: quantize this whole transformer to MXFP6 (no FP4).
+                log(f"Quantizing linear layers in {module_name} to MXFP6 (pure fp6)...")
+                quantize_linear_layers_to_fp6(module, device=f"cuda:{local_rank}")
+                continue
             # Certain models benefit from a hybrid quantization strategy: applying FP8 to
             # a number of transformer blocks while using FP4 for others. This mixed-precision
             # approach balances performance and output quality better than uniform quantization.
             log(f"Quantizing linear layers in {module_name} to FP4...")
-            module = rgetattr(self.pipe, module_name)
             quantize_linear_layers_to_fp4(
                 module,
                 fp8_layers=self.settings.fp8_precision_overrides,
                 fp8_suffix_layers=self.settings.fp8_precision_override_suffixes,
                 use_hybrid_schedule=self.config.use_hybrid_gemm_schedule,
                 device=f"cuda:{local_rank}",
+                use_fp6_for_overrides=self.config.use_fp6_gemms,
             )
         # Any module specified in fp8 gemms modules list and not specified in fp4 gemms module list,
         # will be quantized to fp8, this is specially beneficial for MoE models like Wan2.2,
         # where the low-noise transformer should use FP8 quantization.
         # This transformer generates fine details and requires higher precision to maintain quality.
+        # With use_fp6_gemms the whole module goes to MXFP6 instead (~FP8 accuracy, faster).
         for module_name in self.settings.fp8_gemm_module_list:
             if module_name in self.settings.fp4_gemm_module_list:
                 continue
-            log(f"Quantizing linear layers in {module_name} to FP8...")
             module = rgetattr(self.pipe, module_name)
-            quantize_linear_layers_to_fp8(module, device=f"cuda:{local_rank}")
+            if self.config.use_fp6_gemms or self.config.use_fp6_only:
+                log(f"Quantizing linear layers in {module_name} to MXFP6...")
+                quantize_linear_layers_to_fp6(module, device=f"cuda:{local_rank}")
+            else:
+                log(f"Quantizing linear layers in {module_name} to FP8...")
+                quantize_linear_layers_to_fp8(module, device=f"cuda:{local_rank}")
 
     def _setup_nvfp4_gemms(self, local_rank):
         for module_name in self.settings.fp4_gemm_module_list:
@@ -966,9 +988,13 @@ class xFuserModel(abc.ABC):
         for module_name in self.settings.fp8_gemm_module_list:
             if module_name in self.settings.fp4_gemm_module_list:
                 continue
-            log(f"Quantizing linear layers in {module_name} to FP8...")
             module = rgetattr(self.pipe, module_name)
-            quantize_linear_layers_to_fp8(module, device=f"cuda:{local_rank}")
+            if self.config.use_fp6_gemms or self.config.use_fp6_only:
+                log(f"Quantizing linear layers in {module_name} to MXFP6...")
+                quantize_linear_layers_to_fp6(module, device=f"cuda:{local_rank}")
+            else:
+                log(f"Quantizing linear layers in {module_name} to FP8...")
+                quantize_linear_layers_to_fp8(module, device=f"cuda:{local_rank}")
 
     def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
         return 1

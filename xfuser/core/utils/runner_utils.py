@@ -381,6 +381,35 @@ def _layer_uses_fp8_override(
     return False
 
 
+def quantize_linear_layers_to_fp6(
+    model,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Replace every nn.Linear in a module (tree) with xFuserMXFP6Linear (AITER gemm_a6w6).
+
+    Used as a faster, accuracy-equivalent (~FP8) drop-in for the whole-module FP8 path
+    (e.g. the low-noise transformer_2 in Wan2.2 MoE) and for per-layer FP8 overrides.
+    """
+    from xfuser.model_executor.layers.mxfp6_linear import xFuserMXFP6Linear
+
+    for name, module in list(model.named_children()):
+        if isinstance(module, torch.nn.Linear):
+            weight = module.weight.data
+            bias = module.bias.data if module.bias is not None else None
+            fp6_layer = xFuserMXFP6Linear(
+                module.in_features,
+                module.out_features,
+                bias=(bias is not None),
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+            with torch.no_grad():
+                fp6_layer.load_and_quantize_weights(weight, bias)
+            setattr(model, name, fp6_layer)
+        elif len(list(module.children())) > 0:
+            quantize_linear_layers_to_fp6(module, device=device)
+
+
 def quantize_linear_layers_to_fp4(
     model,
     parent_name='',
@@ -388,25 +417,41 @@ def quantize_linear_layers_to_fp4(
     fp8_suffix_layers: tuple[str] | None = None,
     use_hybrid_schedule: bool = False,
     device: Optional[torch.device] = None,
+    use_fp6_for_overrides: bool = False,
 ):
     from torchao.quantization.granularity import PerTensor
     from torchao.quantization.quant_api import Float8DynamicActivationFloat8WeightConfig, quantize_
     from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear, xFuserHybridMXFP4Linear
+    from xfuser.model_executor.layers.mxfp6_linear import xFuserMXFP6Linear
 
     for name, module in list(model.named_children()):
         full_name = f"{parent_name}.{name}" if parent_name else name
 
         if isinstance(module, torch.nn.Linear):
             if _layer_uses_fp8_override(full_name, fp8_layers, fp8_suffix_layers):
-                quantize_(
-                      module,
-                      config=Float8DynamicActivationFloat8WeightConfig(
-                          granularity=PerTensor(),
-                          set_inductor_config=False,
-                          kernel_preference=_get_fp8_kernel_preference(),
-                    ),
-                    device=device,
-                )
+                if use_fp6_for_overrides:
+                    # Precision-sensitive layer -> MXFP6 (accuracy ~= FP8, GEMM ~2.7-3.8x faster,
+                    # unified all-MX pipeline with the FP4 layers).
+                    fp6_layer = xFuserMXFP6Linear(
+                        module.in_features,
+                        module.out_features,
+                        bias=(module.bias is not None),
+                        device=module.weight.device,
+                        dtype=module.weight.dtype,
+                    )
+                    with torch.no_grad():
+                        fp6_layer.load_and_quantize_weights(module.weight, module.bias)
+                    setattr(model, name, fp6_layer)
+                else:
+                    quantize_(
+                          module,
+                          config=Float8DynamicActivationFloat8WeightConfig(
+                              granularity=PerTensor(),
+                              set_inductor_config=False,
+                              kernel_preference=_get_fp8_kernel_preference(),
+                        ),
+                        device=device,
+                    )
             else:
                 low_precision_layer = xFuserMXFP4Linear(
                     module.in_features,
@@ -457,6 +502,7 @@ def quantize_linear_layers_to_fp4(
                 fp8_suffix_layers=fp8_suffix_layers,
                 use_hybrid_schedule=use_hybrid_schedule,
                 device=device,
+                use_fp6_for_overrides=use_fp6_for_overrides,
             )
 
 

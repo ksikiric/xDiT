@@ -169,6 +169,11 @@ class xFuserArgs:
     # Hybrid GEMM schedule (FP8 high precision + FP4 low precision)
     use_hybrid_gemm_schedule: bool = False
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
+    # Substitute MXFP6 for FP8 everywhere (whole FP8 modules like transformer_2, per-layer
+    # overrides, streaming FP8 blocks). Accuracy ~= FP8, GEMM ~2.7-3.8x faster.
+    use_fp6_gemms: bool = False
+    # Pure MXFP6 for ALL transformer GEMMs (both transformers, all steps) -> clean fp6-vs-fp8.
+    use_fp6_only: bool = False
     # SSTA arguments
     use_ssta_sparse_text_to_image: Optional[bool] = False
     # Sparge attention
@@ -765,6 +770,23 @@ class xFuserArgs:
             type=int,
             default=None,
             help="Number of high-precision GEMM steps at both the start and end of denoising.",
+        )
+        parser.add_argument(
+            "--use_fp6_gemms",
+            action="store_true",
+            default=False,
+            help="Substitute MXFP6 for FP8 everywhere it would be used (whole FP8 modules like "
+                 "the low-noise transformer_2, per-layer FP8 overrides, streaming FP8 blocks). "
+                 "Accuracy ~= FP8, GEMM ~2.7-3.8x faster, unified all-MX pipeline with FP4.",
+        )
+        parser.add_argument(
+            "--use_fp6_only",
+            action="store_true",
+            default=False,
+            help="Pure MXFP6 for ALL transformer GEMMs (both high- and low-noise transformers, "
+                 "all steps): routes the FP4 module list to whole-module FP6 as well. Use for a "
+                 "clean fp6-vs-fp8 whole-model comparison. Requires --use_fp4_gemms to enter the "
+                 "MX setup path.",
         )
         parser.add_argument(
             "--use_vae_channels_last_format",

@@ -21,6 +21,7 @@ from xfuser.core.distributed.attention_backend import SUPPORTS_PRE_QUANTIZATION_
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
+from xfuser.model_executor.layers.mxfp6_linear import xFuserMXFP6Linear
 from xfuser.envs import PACKAGES_CHECKER
 
 env_info = PACKAGES_CHECKER.get_packages_info()
@@ -46,6 +47,28 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         # the I2V image-context sub-call below are dense, so they don't read it.
         self.attention_kwargs = attention_kwargs
 
+    @staticmethod
+    def _run_shared_fp6_projections(
+        input_tensor: torch.Tensor,
+        projections: tuple[xFuserMXFP6Linear, ...],
+    ) -> Optional[tuple[torch.Tensor, ...]]:
+        if not projections or not all(isinstance(proj, xFuserMXFP6Linear) for proj in projections):
+            return None
+        in_features = projections[0].in_features
+        if input_tensor.shape[-1] != in_features or any(proj.in_features != in_features for proj in projections):
+            return None
+
+        original_shape = input_tensor.shape
+        input_2d = input_tensor.view(-1, in_features)
+        a_packed, a_scale = projections[0].pack_activation(input_2d)
+        M = input_2d.shape[0]
+        return tuple(
+            proj.forward_packed_2d(a_packed, a_scale, M, input_tensor.dtype).view(
+                *original_shape[:-1], proj.out_features
+            )
+            for proj in projections
+        )
+
     def _get_qkv_projections(self, attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
         # encoder_hidden_states is only passed for cross-attention
         if encoder_hidden_states is None:
@@ -60,17 +83,35 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 query = attn.to_q(hidden_states)
                 key, value = attn.to_kv(encoder_hidden_states).chunk(2, dim=-1)
         else:
+            if encoder_hidden_states is hidden_states:
+                shared_qkv = self._run_shared_fp6_projections(
+                    hidden_states, (attn.to_q, attn.to_k, attn.to_v)
+                )
+                if shared_qkv is not None:
+                    return shared_qkv
             query = attn.to_q(hidden_states)
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
+            shared_kv = self._run_shared_fp6_projections(
+                encoder_hidden_states, (attn.to_k, attn.to_v)
+            )
+            if shared_kv is not None:
+                key, value = shared_kv
+            else:
+                key = attn.to_k(encoder_hidden_states)
+                value = attn.to_v(encoder_hidden_states)
         return query, key, value
 
     def _get_added_kv_projections(self, attn: "WanAttention", encoder_hidden_states_img: torch.Tensor):
         if attn.fused_projections:
             key_img, value_img = attn.to_added_kv(encoder_hidden_states_img).chunk(2, dim=-1)
         else:
-            key_img = attn.add_k_proj(encoder_hidden_states_img)
-            value_img = attn.add_v_proj(encoder_hidden_states_img)
+            shared_kv = self._run_shared_fp6_projections(
+                encoder_hidden_states_img, (attn.add_k_proj, attn.add_v_proj)
+            )
+            if shared_kv is not None:
+                key_img, value_img = shared_kv
+            else:
+                key_img = attn.add_k_proj(encoder_hidden_states_img)
+                value_img = attn.add_v_proj(encoder_hidden_states_img)
         return key_img, value_img
 
 
