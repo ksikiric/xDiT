@@ -360,6 +360,10 @@ if env_info["has_aiter"]:
         from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
+    try:
+        from aiter.ops.mha import flash_attn_fp8_sparse_pertensor_func
+    except ImportError:
+        pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_FP8 is not available.
 
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
@@ -449,6 +453,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
+    AITER_SPARGE_ASM_FP8 = "AITER Sparge ASM FP8"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
@@ -1145,6 +1150,84 @@ def _aiter_sparge_v2_attn_call(query, key, value, dropout_p, is_causal, attentio
         R=HADAMARD_MATRIX[query.device], config=config,
     )
     return restore_sparge_output(output, state), None
+
+
+# Hand-written gfx950 sparse ASM kernels are hard-wired to (kTileQ, kTileKV) =
+# (256, 128); force the LUT block sizes to match.
+_AITER_SPARGE_ASM_BLOCK_M = 256
+_AITER_SPARGE_ASM_BLOCK_N = 128
+
+
+def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
+    """Per-tensor fp8 (E4M3) quantization of Q, K, V for the all-fp8 sparse path.
+    Mirrors the dense AITER_FP8 quant: dynamic per_tensor_quant already returns
+    fp32 [1] descales, so they're used as-is (no extra casts/reshapes)."""
+    quant_dtype = aiter.dtypes.fp8
+    dtype_max = torch.finfo(quant_dtype).max
+    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged); V not rotated.
+    R = FP8_HADAMARD_MATRIX[q_bshd.device]
+    q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
+    k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
+    q_fp8, q_descale = aiter.per_tensor_quant(
+        q_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
+    )
+    k_fp8, k_descale = aiter.per_tensor_quant(
+        k_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
+    )
+    v_fp8, v_descale = aiter.per_tensor_quant(
+        v_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
+    )
+    return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
+
+
+@register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_FP8)
+def _aiter_sparge_asm_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Block-sparse all-fp8 (E4M3 Q/K/V) ASM attention, intra-GPU load-balanced.
+
+    Routes through ``flash_attn_fp8_sparse_pertensor_func`` ->
+    ``fmha_v3_fwd_fp8_sparse`` -> the hand-written ``fwd_hd128_fp8_sparse.co``. That
+    kernel is launched on a flat 1-WG-per-tile grid driven by an LPT-sorted work table
+    (built host-side from ``lut_count``), so the few heaviest sparse tiles dispatch
+    first and the one-WG-per-tile tail latency (intra-GPU imbalance) collapses.
+    """
+    config = {
+        "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
+        "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N,
+    }
+    q, k, v, state, block_mask, num_heads = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config,
+    )
+
+    q_bshd = q.permute(0, 2, 1, 3).contiguous()
+    k_bshd = k.permute(0, 2, 1, 3).contiguous()
+    v_bshd = v.permute(0, 2, 1, 3).contiguous()
+
+    q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = _asm_sparge_fp8_quantize(
+        q_bshd, k_bshd, v_bshd,
+    )
+
+    block_lut = block_attn_mask_to_ragged_lut(
+        block_mask,
+        num_heads=num_heads,
+        return_none_if_dense=False,
+        BLOCK_KB=_AITER_SPARGE_ASM_BLOCK_N,
+    )
+    kv_block_indices, lut_start, lut_count = block_lut
+
+    softmax_scale = q_bshd.shape[-1] ** -0.5
+    out_bshd = flash_attn_fp8_sparse_pertensor_func(
+        q_fp8, k_fp8, v_fp8,
+        q_descale.contiguous(),
+        k_descale.contiguous(),
+        v_descale.contiguous(),
+        kv_block_indices.to(torch.int32).contiguous(),
+        lut_start.to(torch.int32).contiguous(),
+        lut_count.to(torch.int32).contiguous(),
+        softmax_scale=float(softmax_scale),
+    )
+    output = out_bshd.permute(0, 2, 1, 3)
+    return restore_sparge_output(output, state), None
+
 
 @register_attention_function(AttentionBackendType.FLEX_BLOCK_SPARGE)
 def _flex_block_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
