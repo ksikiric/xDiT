@@ -4,6 +4,7 @@ import inspect
 import math
 import torch.nn.functional as F
 from enum import Enum
+from typing import Optional, Tuple
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
 from xfuser.core.distributed.ssta import (
     setup_ssta,
@@ -490,6 +491,10 @@ SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
     AttentionBackendType.AITER_FP8,
     AttentionBackendType.AITER_SAGE_V2,
     AttentionBackendType.AITER_MXFP4,
+    AttentionBackendType.AITER_SPARGE_ASM_FP8,
+    AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
+    AttentionBackendType.AITER_SPARGE_ASM_V2,
+    AttentionBackendType.AITER_SPARGE_ASM_V2_AFFINE_SORTED,
 }
 
 def register_attention_function(backend_type):
@@ -1137,6 +1142,19 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
         block_m=config["BLOCK_M"], block_n=config["BLOCK_N"],
         pad_block_divisible=pad_block_divisible,
     )
+
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
+
+    kwargs = {}
+    if pre_quantized:
+        kwargs.update(
+            {
+                "q_descale": attention_kwargs["q_descale"],
+                "k_descale": attention_kwargs["k_descale"],
+            }
+        )
+
     block_mask = compute_sparge_block_mask(
         q, k,
         simthreshd1=simthreshd1,
@@ -1145,6 +1163,7 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
         static_block_mask=static_mask,
         text_len=state.text_len + state.tail_pad,
         block_m=config["BLOCK_M"], block_n=config["BLOCK_N"],
+        **kwargs,
     )
     block_mask = mask_padded_kv_blocks(block_mask, state, config["BLOCK_N"])
     num_heads = q.shape[1]
@@ -1235,25 +1254,37 @@ def _aiter_sparge_asm_attn_call(query, key, value, dropout_p, is_causal, attenti
     return restore_sparge_output(output, state), None
 
 
-def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd: torch.Tensor):
+def _asm_sparge_fp8_quantize(
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+    attention_kwargs: Optional[dict] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 (E4M3) quantization of Q, K, V for the all-fp8 sparse path.
     Mirrors the dense AITER_FP8 quant: dynamic per_tensor_quant already returns
     fp32 [1] descales, so they're used as-is (no extra casts/reshapes)."""
-    quant_dtype = aiter.dtypes.fp8
-    dtype_max = torch.finfo(quant_dtype).max
-    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged); V not rotated.
-    R = FP8_HADAMARD_MATRIX[q_bshd.device]
-    q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
-    k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
-    q_fp8, q_descale = aiter.per_tensor_quant(
-        q_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
-    )
-    k_fp8, k_descale = aiter.per_tensor_quant(
-        k_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
-    )
-    v_fp8, v_descale = aiter.per_tensor_quant(
-        v_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
-    )
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
+
+    if pre_quantized:
+        q_fp8, k_fp8, v_fp8 = q_bshd, k_bshd, v_bshd
+        q_descale, k_descale, v_descale = attention_kwargs["q_descale"], attention_kwargs["k_descale"], attention_kwargs["v_descale"]
+    else:
+        quant_dtype = aiter.dtypes.fp8
+        dtype_max = torch.finfo(quant_dtype).max
+        # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged); V not rotated.
+        R = FP8_HADAMARD_MATRIX[q_bshd.device]
+        q_bshd = _fp8_hadamard_rotate(q_bshd, R).contiguous()
+        k_bshd = _fp8_hadamard_rotate(k_bshd, R).contiguous()
+        q_fp8, q_descale = aiter.per_tensor_quant(
+            q_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        )
+        k_fp8, k_descale = aiter.per_tensor_quant(
+            k_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        )
+        v_fp8, v_descale = aiter.per_tensor_quant(
+            v_bshd, scale=None, quant_dtype=quant_dtype, dtypeMax=dtype_max,
+        )
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
 
 
@@ -1279,7 +1310,7 @@ def _aiter_sparge_asm_fp8_attn_call(query, key, value, dropout_p, is_causal, att
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = _asm_sparge_fp8_quantize(
-        q_bshd, k_bshd, v_bshd,
+        q_bshd, k_bshd, v_bshd, attention_kwargs,
     )
 
     block_lut = block_attn_mask_to_ragged_lut(
@@ -1331,7 +1362,7 @@ def _aiter_sparge_asm_fp8_affine_sorted_attn_call(query, key, value, dropout_p, 
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = _asm_sparge_fp8_quantize(
-        q_bshd, k_bshd, v_bshd,
+        q_bshd, k_bshd, v_bshd, attention_kwargs,
     )
 
     block_lut = block_attn_mask_to_ragged_lut(
@@ -1363,6 +1394,8 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
     """Sparse mxfp4 ASM attention (mxfp4 Q/K + fp8 V)."""
     # ASM kernel is hard-wired to kTileKV=128; force the LUT block size to
     # match (Triton tuner may otherwise pick 64).
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
     config = {**get_sage_fwd_configs_mxfp4(),
               "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
               "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N}
@@ -1375,9 +1408,9 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
+    mxfp4_quant_kwargs = dict(
+        FP8_TYPE=fp8_type,
+        FP8_MAX=torch.finfo(fp8_type).max,
         BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
         BLKK=64,
         layout="bshd",
@@ -1385,6 +1418,24 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
         BLOCK_R=AITER_SAGE_V2_BLOCK_R,
         q_smoothing=False,
     )
+    if (
+        pre_quantized
+        and q_bshd.dtype in _FP8_INPUT_DTYPES
+        and k_bshd.dtype in _FP8_INPUT_DTYPES
+    ):
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            **mxfp4_quant_kwargs,
+            q_input_scale=attention_kwargs["q_descale"],
+            k_input_scale=attention_kwargs["k_descale"],
+            v_scale=attention_kwargs["v_descale"] if v_bshd.dtype in _FP8_INPUT_DTYPES else None,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs,
+        )
 
     kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
         block_mask,
@@ -1420,6 +1471,8 @@ def _aiter_sparge_asm_v2_affine_sorted_attn_call(query, key, value, dropout_p, i
     collapses. The math is identical to the base mxfp4 sparse path (softmax is
     order-independent), so it is bit-exact with AITER_SPARGE_ASM_V2.
     """
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
     config = {**get_sage_fwd_configs_mxfp4(),
               "BLOCK_M": _AITER_SPARGE_ASM_BLOCK_M,
               "BLOCK_N": _AITER_SPARGE_ASM_BLOCK_N}
@@ -1432,9 +1485,9 @@ def _aiter_sparge_asm_v2_affine_sorted_attn_call(query, key, value, dropout_p, i
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
+    mxfp4_quant_kwargs = dict(
+        FP8_TYPE=fp8_type,
+        FP8_MAX=torch.finfo(fp8_type).max,
         BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
         BLKK=64,
         layout="bshd",
@@ -1442,6 +1495,24 @@ def _aiter_sparge_asm_v2_affine_sorted_attn_call(query, key, value, dropout_p, i
         BLOCK_R=AITER_SAGE_V2_BLOCK_R,
         q_smoothing=False,
     )
+    if (
+        pre_quantized
+        and q_bshd.dtype in _FP8_INPUT_DTYPES
+        and k_bshd.dtype in _FP8_INPUT_DTYPES
+    ):
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            **mxfp4_quant_kwargs,
+            q_input_scale=attention_kwargs["q_descale"],
+            k_input_scale=attention_kwargs["k_descale"],
+            v_scale=attention_kwargs["v_descale"] if v_bshd.dtype in _FP8_INPUT_DTYPES else None,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs,
+        )
 
     kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
         block_mask,
