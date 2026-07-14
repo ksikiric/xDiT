@@ -218,7 +218,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SAGE_V2,
                                  AttentionBackendType.AITER_SPARSE_SAGE_V2,
                                  AttentionBackendType.AITER_SPARGE_V2,
-                                 AttentionBackendType.AITER_SPARGE_ASM_FP8,
+                                 AttentionBackendType.AITER_SPARGE_FP8,
                                  AttentionBackendType.AITER_FLYDSL,
                                  AttentionBackendType.FLEX_BLOCK_ATTN,
                                  AttentionBackendType.FLEX_BLOCK_SPARGE]:
@@ -313,7 +313,7 @@ class RuntimeState(metaclass=ABCMeta):
                     raise RuntimeError(msg) from None
             except ImportError:
                 raise RuntimeError(msg) from None
-        elif attention_backend == AttentionBackendType.AITER_SPARGE_ASM_FP8:
+        elif attention_backend == AttentionBackendType.AITER_SPARGE_FP8:
             try:
                 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
                 from aiter.ops.mha import (
