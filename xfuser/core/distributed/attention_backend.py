@@ -363,7 +363,7 @@ if env_info["has_aiter"]:
     try:
         from aiter.ops.mha import flash_attn_fp8_sparse_pertensor_func
     except ImportError:
-        pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_FP8 is not available.
+        pass # Error is raised in runtime_state.py if AITER_SPARGE_FP8 is not available.
 
     AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
@@ -453,7 +453,7 @@ class AttentionBackendType(Enum):
     AITER_SPARSE_SAGE_V2 = "AITER Sparse Sage V2"
     AITER_SPARGE = "AITER Sparge"
     AITER_SPARGE_V2 = "AITER Sparge V2"
-    AITER_SPARGE_ASM_FP8 = "AITER Sparge ASM FP8"
+    AITER_SPARGE_FP8 = "AITER Sparge FP8"
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
@@ -1180,8 +1180,8 @@ def _asm_sparge_fp8_quantize(q_bshd: torch.Tensor, k_bshd: torch.Tensor, v_bshd:
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
 
 
-@register_attention_function(AttentionBackendType.AITER_SPARGE_ASM_FP8)
-def _aiter_sparge_asm_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+@register_attention_function(AttentionBackendType.AITER_SPARGE_FP8)
+def _aiter_sparge_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """Block-sparse all-fp8 (E4M3 Q/K/V) ASM attention, intra-GPU load-balanced.
 
     Routes through ``flash_attn_fp8_sparse_pertensor_func`` ->
