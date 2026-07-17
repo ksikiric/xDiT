@@ -90,8 +90,14 @@ class Fp8CommsState:
     Per-layer scales live on each attn1 module as compile-friendly buffers; this class
     holds per-model running amaxes during calibration only.
     """
-    def __init__(self, fixed_scale: Optional[float] = None):
+    def __init__(self, fixed_scale: Optional[float] = None, safety_factor: float = _FP8_COMMS_SAFETY_FACTOR):
         self.fixed_scale = fixed_scale
+        # Calibrated per-layer scale = amax / (FP8_MAX * safety_factor). A smaller
+        # safety_factor enlarges the scale, so the calibrated amax maps further below
+        # FP8_MAX and live values above the calibrated peak no longer clip. Lowering it
+        # is free for fp8 (over-scaling is lossless) => removes calibration clipping at
+        # zero runtime cost.
+        self.safety_factor = safety_factor
         self._models: dict[int, Fp8CommsModelState] = {}
         self.calibrated_model_ids: set = set()
 
@@ -274,14 +280,15 @@ class RuntimeState(metaclass=ABCMeta):
             self.fp8_comms = None
             return
         scale = config.runtime_config.fp8_comms_scale
+        safety_factor = config.runtime_config.fp8_comms_safety_factor
         if scale is not None:
             logger.warning(f"FP8 communication enabled with fixed scale {scale}.")
         else:
             logger.warning(
-                "FP8 communication enabled with dynamic per-layer scaling "
-                "(calibrated before inference)."
+                "FP8 communication enabled with static per-layer scaling "
+                f"(calibrated once before inference; safety_factor={safety_factor})."
             )
-        self.fp8_comms = Fp8CommsState(fixed_scale=scale)
+        self.fp8_comms = Fp8CommsState(fixed_scale=scale, safety_factor=safety_factor)
 
     def sync_fp8_comms(self, model=None):
         """All-reduce per-layer running amaxes and scatter scales into attn1 buffers.
@@ -312,7 +319,9 @@ class RuntimeState(metaclass=ABCMeta):
             dim=0,
         )
         dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-        scales = maxes.clamp(min=1e-6) / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
+        # A smaller safety_factor enlarges the scale so live values above the
+        # calibrated amax still map below FP8_MAX -> no clipping. Free for fp8.
+        scales = maxes.clamp(min=1e-6) / (dtype_max * fp8_comms.safety_factor)
         fp8_comms._scatter_scales_to_model(model, scales[0], scales[1], scales[2], scales[3])
         model_state.q_running_max.zero_()
         model_state.k_running_max.zero_()

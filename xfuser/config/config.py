@@ -71,6 +71,7 @@ class RuntimeConfig:
     use_spargeattn_head_balance: bool = False
     use_fp8_comms: bool = False
     fp8_comms_scale: Optional[float] = None
+    fp8_comms_safety_factor: float = 0.85
 
     def __post_init__(self):
         check_packages()

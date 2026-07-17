@@ -142,6 +142,7 @@ class xFuserArgs:
     fp8_precision_override_suffix_patterns: Optional[str] = None
     use_fp8_comms: bool = False
     fp8_comms_scale: Optional[float] = None
+    fp8_comms_safety_factor: float = 0.85
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -424,6 +425,15 @@ class xFuserArgs:
             default=None,
             help="Override the model-specific FP8 communication scale.",
         )
+        runtime_group.add_argument(
+            "--fp8_comms_safety_factor",
+            type=float,
+            default=0.85,
+            help="Safety factor for the calibrated FP8 comms scale: scale = amax / "
+                 "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
+                 "leave more headroom before fp8 saturation, removing static-calibration "
+                 "clipping at zero runtime cost (over-scaling is lossless for fp8). Default 0.85.",
+        )
 
         # DiTFastAttn arguments
         fast_attn_group = parser.add_argument_group("DiTFastAttn Options")
@@ -657,6 +667,15 @@ class xFuserArgs:
             type=float,
             default=None,
             help="Override the model-specific FP8 communication scale.",
+        )
+        parser.add_argument(
+            "--fp8_comms_safety_factor",
+            type=float,
+            default=0.85,
+            help="Safety factor for the calibrated FP8 comms scale: scale = amax / "
+                 "(FP8_MAX * safety_factor). LOWER it (e.g. 0.4) to enlarge the scale and "
+                 "leave more headroom before fp8 saturation, removing static-calibration "
+                 "clipping at zero runtime cost (over-scaling is lossless for fp8). Default 0.85.",
         )
 
         parser.add_argument(
@@ -939,6 +958,7 @@ class xFuserArgs:
             use_spargeattn_head_balance=self.use_spargeattn_head_balance,
             use_fp8_comms=self.use_fp8_comms,
             fp8_comms_scale=self.fp8_comms_scale,
+            fp8_comms_safety_factor=self.fp8_comms_safety_factor,
         )
 
         parallel_config = ParallelConfig(
