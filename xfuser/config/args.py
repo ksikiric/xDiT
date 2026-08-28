@@ -33,13 +33,13 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
     def _normalize_name(self, name: str) -> str:
         # First, try the standard normalization (all hyphens to underscores)
-        fully_normalized = "--" + name[len("--") :].replace("-", "_")
+        fully_normalized = "--" + name[len("--"):].replace("-", "_")
         if fully_normalized in self._option_string_actions:
             return fully_normalized
 
         # If not found, check if it's a BooleanOptionalAction (starts with --no-)
         if name.startswith("--no-"):
-            no_dash_normalized = "--no-" + name[len("--no-") :].replace("-", "_")
+            no_dash_normalized = "--no-" + name[len("--no-"):].replace("-", "_")
             if no_dash_normalized in self._option_string_actions:
                 return no_dash_normalized
 
@@ -457,7 +457,7 @@ class xFuserArgs:
             "--enable_group_cpu_offload",
             action="store_true",
             help="Async leaf-level group CPU offload (streamed, per-group pinned). Overlaps H2D "
-            "transfer with compute; upstream diffusers group offloading.",
+                 "transfer with compute; upstream diffusers group offloading.",
         )
         runtime_group.add_argument(
             "--enable_tiling",
@@ -468,37 +468,37 @@ class xFuserArgs:
             "--enable_slicing",
             action="store_true",
             help="Decode one batch item at a time to reduce GPU memory use. This has no effect "
-            "when the batch size is 1.",
+                 "when the batch size is 1.",
         )
         runtime_group.add_argument(
             "--vae_tile_size_height",
             type=int,
             default=None,
             help="Exact output-pixel height of each VAE tile. Requires --enable_tiling. "
-            "Must be used with --vae_tile_size_width.",
+                 "Must be used with --vae_tile_size_width.",
         )
         runtime_group.add_argument(
             "--vae_tile_size_width",
             type=int,
             default=None,
             help="Exact output-pixel width of each VAE tile. Requires --enable_tiling. "
-            "Must be used with --vae_tile_size_height.",
+                 "Must be used with --vae_tile_size_height.",
         )
         runtime_group.add_argument(
             "--vae_tile_overlap_height",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the height axis, in output pixels. Requires "
-            "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
-            "may differ; use 0 for an inactive strip axis.",
+                 "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
+                 "may differ; use 0 for an inactive strip axis.",
         )
         runtime_group.add_argument(
             "--vae_tile_overlap_width",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the width axis, in output pixels. Requires "
-            "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
-            "may differ; use 0 for an inactive strip axis.",
+                 "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
+                 "may differ; use 0 for an inactive strip axis.",
         )
         runtime_group.add_argument(
             "--use_fp8_t5_encoder",
@@ -555,6 +555,7 @@ class xFuserArgs:
 
         return parser
 
+
     @staticmethod
     def add_runner_args(parser: FlexibleArgumentParser):
         parser.add_argument(
@@ -564,8 +565,9 @@ class xFuserArgs:
             required=True,
         )
         parser.add_argument(
-            "--use_parallel_vae", help="Enable parallel VAE.", action="store_true"
-        )
+            "--use_parallel_vae",
+            help="Enable parallel VAE.",
+            action="store_true")
         parser.add_argument(
             "--use_torch_compile",
             action="store_true",
@@ -625,35 +627,35 @@ class xFuserArgs:
             "--fully_shard_degree",
             type=int,
             default=1,
-            help="Fully sharding (sharding) degree.",
+            help="Fully sharding (sharding) degree."
         )
         parser.add_argument(
             "--no_reshard_after_forward",
             dest="reshard_after_forward",
             action="store_false",
             help="Keep parameters gathered after each block's forward instead of resharding. "
-            "Trades memory for latency by eliminating repeated all-gathers. "
-            "Only valid with --fully_shard_degree > 1.",
+                 "Trades memory for latency by eliminating repeated all-gathers. "
+                 "Only valid with --fully_shard_degree > 1.",
         )
         parser.add_argument(
             "--memory_efficient_sharding",
             action="store_true",
             default=False,
             help="Reduce peak VRAM during load: shard transformer blocks one at a time on GPU "
-            "during init, so the full unsharded component never materializes on device. "
-            "Slightly slower to load - use if the model OOMs on GPU during init. Requires "
-            "--fully_shard_degree > 1.",
+                 "during init, so the full unsharded component never materializes on device. "
+                 "Slightly slower to load - use if the model OOMs on GPU during init. Requires "
+                 "--fully_shard_degree > 1.",
         )
         parser.add_argument(
             "--memory_efficient_replicated_load",
             action="store_true",
             default=False,
             help="Reduce peak host RAM when a model that fits one GPU is replicated across ranks "
-            "(pure sequence/CFG/data parallelism): rank0 loads the real weights and peers "
-            "build on meta and receive them over a GPU->GPU broadcast, so host peak is 1x the "
-            "model instead of Nx. Use if the load is OOM-killed on host as rank count grows. "
-            "No effect with weight-splitting parallelism (FSDP/PipeFusion/tensor parallel), "
-            "which loads per-rank weights anyway, or on a single rank.",
+                 "(pure sequence/CFG/data parallelism): rank0 loads the real weights and peers "
+                 "build on meta and receive them over a GPU->GPU broadcast, so host peak is 1x the "
+                 "model instead of Nx. Use if the load is OOM-killed on host as rank count grows. "
+                 "No effect with weight-splitting parallelism (FSDP/PipeFusion/tensor parallel), "
+                 "which loads per-rank weights anyway, or on a single rank.",
         )
         parser.add_argument(
             "--height",
@@ -677,8 +679,7 @@ class xFuserArgs:
             help="Prompt for the model.",
         )
         parser.add_argument(
-            "--negative_prompt",
-            type=str,
+            "--negative_prompt", type=str,
             nargs="*",
             help="Negative prompt for the model.",
         )
@@ -693,7 +694,10 @@ class xFuserArgs:
             help="Max sequence length of prompt",
         )
         parser.add_argument(
-            "--seed", type=int, default=42, help="Random seed for operations."
+            "--seed",
+            type=int,
+            default=42,
+            help="Random seed for operations."
         )
         parser.add_argument(
             "--guidance_scale",
@@ -729,8 +733,8 @@ class xFuserArgs:
             "--group_offload_low_cpu_mem",
             action="store_true",
             help="With --enable_group_cpu_offload, pin each tensor as it is offloaded instead of "
-            "pre-pinning whole components. Keeps host RAM flat on hosts where it is the "
-            "binding constraint, at some of the streaming speedup.",
+                 "pre-pinning whole components. Keeps host RAM flat on hosts where it is the "
+                 "binding constraint, at some of the streaming speedup.",
         )
         parser.add_argument(
             "--enable_tiling",
@@ -741,37 +745,37 @@ class xFuserArgs:
             "--enable_slicing",
             action="store_true",
             help="Decode one batch item at a time to reduce GPU memory use. This has no effect "
-            "when the batch size is 1.",
+                 "when the batch size is 1.",
         )
         parser.add_argument(
             "--vae_tile_size_height",
             type=int,
             default=None,
             help="Exact output-pixel height of each VAE tile. Requires --enable_tiling. "
-            "Must be used with --vae_tile_size_width.",
+                 "Must be used with --vae_tile_size_width.",
         )
         parser.add_argument(
             "--vae_tile_size_width",
             type=int,
             default=None,
             help="Exact output-pixel width of each VAE tile. Requires --enable_tiling. "
-            "Must be used with --vae_tile_size_height.",
+                 "Must be used with --vae_tile_size_height.",
         )
         parser.add_argument(
             "--vae_tile_overlap_height",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the height axis, in output pixels. Requires "
-            "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
-            "may differ; use 0 for an inactive strip axis.",
+                 "--enable_tiling. Must be used with --vae_tile_overlap_width. Height and width "
+                 "may differ; use 0 for an inactive strip axis.",
         )
         parser.add_argument(
             "--vae_tile_overlap_width",
             type=int,
             default=None,
             help="Exact VAE tile overlap along the width axis, in output pixels. Requires "
-            "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
-            "may differ; use 0 for an inactive strip axis.",
+                 "--enable_tiling. Must be used with --vae_tile_overlap_height. Height and width "
+                 "may differ; use 0 for an inactive strip axis.",
         )
         parser.add_argument(
             "--use_int8_gemms",
@@ -787,9 +791,9 @@ class xFuserArgs:
             "--use_fp8_text_encoder",
             action="store_true",
             help="Also quantize the text encoder's linear layers to FP8 (selected models only). "
-            "Requires --use_fp8_gemms, which covers the transformer alone. Frees several GB "
-            "for large bf16 text encoders, at whatever output-quality cost FP8 carries for "
-            "the encoder; off by default because that is a quality trade-off, not a free win.",
+                 "Requires --use_fp8_gemms, which covers the transformer alone. Frees several GB "
+                 "for large bf16 text encoders, at whatever output-quality cost FP8 carries for "
+                 "the encoder; off by default because that is a quality trade-off, not a free win.",
         )
         parser.add_argument(
             "--use_fp4_gemms",
@@ -831,13 +835,13 @@ class xFuserArgs:
             "--num_iterations",
             type=int,
             default=1,
-            help="Number of iterations to run the model.",
+            help="Number of iterations to run the model."
         )
         parser.add_argument(
             "--profile",
             default=False,
             action="store_true",
-            help="Whether to run Pytorch profiler. See --profile_wait, --profile_warmup and --profile_active for profiler specific warmup.",
+            help="Whether to run Pytorch profiler. See --profile_wait, --profile_warmup and --profile_active for profiler specific warmup."
         )
         parser.add_argument(
             "--profile_wait",
@@ -884,7 +888,7 @@ class xFuserArgs:
         parser.add_argument(
             "--task",
             default=None,
-            help="Task to perform. Only applicable if the model supports multiple tasks.",
+            help="Task to perform. Only applicable if the model supports multiple tasks."
         )
         parser.add_argument(
             "--batch_size",
@@ -901,7 +905,7 @@ class xFuserArgs:
             "--use_hybrid_attn_schedule",
             action="store_true",
             default=False,
-            help="Enable hybrid attention schedule for faster inference and improved quality.",
+            help="Enable hybrid attention schedule for faster inference and improved quality."
         )
         parser.add_argument(
             "--hybrid_attn_low_precision_backend",
@@ -968,22 +972,22 @@ class xFuserArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Reorder image tokens via the gilbert space-filling curve "
-            "before Sparge attention. Use --no-spargeattn_reorder_sequence to disable.",
+                 "before Sparge attention. Use --no-spargeattn_reorder_sequence to disable."
         )
         parser.add_argument(
             "--use_spargeattn_static_block_mask",
             action=argparse.BooleanOptionalAction,
             default=True,
             help="OR a static gilbert block-neighbor mask into the dynamic "
-            "Sparge block mask. Only meaningful when "
-            "--spargeattn_reorder_sequence is set. Use --no-use_spargeattn_static_block_mask to disable.",
+                 "Sparge block mask. Only meaningful when "
+                 "--spargeattn_reorder_sequence is set. Use --no-use_spargeattn_static_block_mask to disable."
         )
         parser.add_argument(
             "--use_spargeattn_head_balance",
             action="store_true",
             help="Balance per-rank attention work across Ulysses ranks by "
-            "permuting heads (block-sparse load balancing). Only has an "
-            "effect with ulysses_degree>1 and a Sparge attention backend.",
+                 "permuting heads (block-sparse load balancing). Only has an "
+                 "effect with ulysses_degree>1 and a Sparge attention backend.",
         )
         parser.add_argument(
             "--vsa_block_size",
@@ -1002,7 +1006,7 @@ class xFuserArgs:
             type=float,
             default=0.0,
             help="Minimum selected KV-block fraction for AITER VSA. "
-            "For Jenga drop rate r, set this to 1-r.",
+                 "For Jenga drop rate r, set this to 1-r.",
         )
         parser.add_argument(
             "--vsa_drop_rates",
@@ -1010,8 +1014,8 @@ class xFuserArgs:
             nargs="+",
             default=None,
             help="Enable Jenga's per-step sparse schedule. One value applies "
-            "to all steps; two values switch after the midpoint. "
-            "Drop rates <=0.25 use dense AITER attention.",
+                 "to all steps; two values switch after the midpoint. "
+                 "Drop rates <=0.25 use dense AITER attention.",
         )
         parser.add_argument(
             "--vsa_prob_threshold",
@@ -1077,33 +1081,27 @@ class xFuserArgs:
             default=None,
             help=(
                 "JSON string of advanced config overrides merged on top of preset defaults. "
-                'E.g. \'{"residual_diff_threshold": 0.5, "max_warmup_steps": 6}\'. '
+                "E.g. '{\"residual_diff_threshold\": 0.5, \"max_warmup_steps\": 6}'. "
                 "Keys must match DBCacheConfig fields (cache-dit)."
             ),
         )
         return parser
+
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         # Set the attributes from the parsed arguments.
-        engine_args = cls(
-            **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
-        )
+        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
         return engine_args
 
     @classmethod
     def from_runner_args(cls, args: dict):
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        engine_args = cls(
-            **{
-                arg_name: arg_value
-                for arg_name, arg_value in args.items()
-                if arg_name in attrs
-            }
-        )
+        engine_args = cls(**{arg_name: arg_value for arg_name, arg_value in args.items() if arg_name in attrs})
         return engine_args
+
 
     def _validate_gemm_quantization_flags(self) -> None:
         """Validate ownership of mutually exclusive generic GEMM quantizers."""
@@ -1138,11 +1136,7 @@ class xFuserArgs:
                 "--use_int8_gemms cannot be combined with --use_fp8_gemms or "
                 "--use_fp4_gemms, including explicit hybrid FP8/FP4 mode."
             )
-        if (
-            self.use_fp8_gemms
-            and self.use_fp4_gemms
-            and not self.use_hybrid_gemm_schedule
-        ):
+        if self.use_fp8_gemms and self.use_fp4_gemms and not self.use_hybrid_gemm_schedule:
             raise ValueError(
                 "--use_fp8_gemms and --use_fp4_gemms cannot both be enabled unless "
                 "--use_hybrid_gemm_schedule explicitly owns the mixed FP8/FP4 mode."
@@ -1166,13 +1160,11 @@ class xFuserArgs:
         else:
             self.world_size = torch.distributed.get_world_size()
 
-        if self.dit_parallel_size == 0 and (
-            not self.use_parallel_vae or self.vae_parallel_size == 0
-        ):
+        if self.dit_parallel_size == 0 and (not self.use_parallel_vae or self.vae_parallel_size == 0):
             self.dit_parallel_size = self.world_size
-        assert (
-            self.dit_parallel_size + self.vae_parallel_size == self.world_size
-        ), f"DIT parallel size {self.dit_parallel_size} and VAE parallel size {self.vae_parallel_size} must sum to world size {self.world_size}"
+        assert self.dit_parallel_size+self.vae_parallel_size == self.world_size, (
+            f"DIT parallel size {self.dit_parallel_size} and VAE parallel size {self.vae_parallel_size} must sum to world size {self.world_size}"
+        )
 
         # Hybrid attention schedule validation
         if self.use_hybrid_attn_schedule:
@@ -1181,17 +1173,9 @@ class xFuserArgs:
                     "When use_hybrid_attn_schedule is True, attention_backend must not be set."
                 )
             if self.hybrid_attn_schedule is not None:
-                if (
-                    self.hybrid_attn_low_precision_backend is not None
-                    or self.hybrid_attn_high_precision_backend is not None
-                ):
-                    raise ValueError(
-                        "When an explicit hybrid attention schedule is provided, neither hybrid_attn_low_precision_backend nor hybrid_attn_high_precision_backend may be set."
-                    )
-            elif (
-                self.hybrid_attn_low_precision_backend is None
-                or self.hybrid_attn_high_precision_backend is None
-            ):
+                if self.hybrid_attn_low_precision_backend is not None or self.hybrid_attn_high_precision_backend is not None:
+                    raise ValueError("When an explicit hybrid attention schedule is provided, neither hybrid_attn_low_precision_backend nor hybrid_attn_high_precision_backend may be set.")
+            elif self.hybrid_attn_low_precision_backend is None or self.hybrid_attn_high_precision_backend is None:
                 raise ValueError(
                     "When use_hybrid_attn_schedule is True, both hybrid_attn_low_precision_backend and "
                     "hybrid_attn_high_precision_backend must be set."

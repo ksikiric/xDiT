@@ -61,6 +61,49 @@ def test_runtime_selects_explicit_aiter_only_fp6_contracts(
 
 
 @pytest.mark.parametrize(
+    "offload_flag",
+    [
+        "enable_model_cpu_offload",
+        "enable_sequential_cpu_offload",
+        "enable_group_cpu_offload",
+    ],
+)
+def test_mixed_fp4_fp6_rejects_every_cpu_offload_mode(modules, offload_flag):
+    contracts = modules.contracts
+    config = _config(use_fp6_gemms=True, **{offload_flag: True})
+
+    with pytest.raises(contracts.UnsupportedLoadContract) as refusal:
+        contracts.assert_offload_is_compatible_with_format(
+            config,
+            requested_format=contracts.QuantizationFormat.FP4_FP6,
+            selected_backend=contracts.QuantizationBackend.AITER,
+        )
+
+    message = str(refusal.value)
+    assert f"--{offload_flag}" in message
+    assert "primary MXFP4 packing path is unsupported" in message
+
+
+@pytest.mark.parametrize(
+    "offload_flag",
+    [
+        "enable_model_cpu_offload",
+        "enable_sequential_cpu_offload",
+        "enable_group_cpu_offload",
+    ],
+)
+def test_pure_fp6_does_not_reject_supported_cpu_offload_modes(modules, offload_flag):
+    contracts = modules.contracts
+    config = _config(use_fp6_only=True, **{offload_flag: True})
+
+    contracts.assert_offload_is_compatible_with_format(
+        config,
+        requested_format=contracts.QuantizationFormat.FP6,
+        selected_backend=contracts.QuantizationBackend.AITER,
+    )
+
+
+@pytest.mark.parametrize(
     ("flags", "cuda", "reason"),
     [
         ({"use_fp6_gemms": True, "use_fp6_only": True}, False, "together"),

@@ -99,7 +99,9 @@ def _prepare_native_load(
             # broader coverage than was requested.
             stream_quant=(
                 stream_quant
-                and not getattr(model.settings, "fp8_gemm_include_suffixes", None)
+                and not getattr(
+                    model.settings, "fp8_gemm_include_suffixes", None
+                )
             ),
             model_factory=model_factory,
         )
@@ -115,7 +117,9 @@ def _prepare_native_load(
             (model.settings.fp8_precision_overrides or ()) if is_fp4 else ()
         ),
         precision_suffixes=(
-            (model.settings.fp8_precision_override_suffixes or ()) if is_fp4 else ()
+            (model.settings.fp8_precision_override_suffixes or ())
+            if is_fp4
+            else ()
         ),
         hybrid=(model.config.use_hybrid_gemm_schedule if is_fp4 else False),
         model_factory=model_factory,
@@ -241,7 +245,9 @@ def load_transformer(
                 f"{component_name} uses a mapped checkpoint source but "
                 f"cannot enter local blockwise loading: {reason}"
             )
-        _record_native_quantization(ledger, adapter, component_name, prepared, targets)
+        _record_native_quantization(
+            ledger, adapter, component_name, prepared, targets
+        )
         quantization_config = prepared.quantization_config
 
     load_kwargs = request.from_pretrained_kwargs()

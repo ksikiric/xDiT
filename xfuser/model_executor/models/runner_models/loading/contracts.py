@@ -39,7 +39,9 @@ class LoadRoute(Flag):
     LOCAL_BLOCKWISE = auto()
 
 
-STANDARD_LOAD_ROUTES = LoadRoute.STANDARD_COLLECTIVES | LoadRoute.LOCAL_BLOCKWISE
+STANDARD_LOAD_ROUTES = (
+    LoadRoute.STANDARD_COLLECTIVES | LoadRoute.LOCAL_BLOCKWISE
+)
 
 
 @dataclass(frozen=True)
@@ -307,9 +309,7 @@ def assert_requested_materialization_is_honoured(config, *, world_size: int) -> 
             "--pipefusion_parallel_degree": config.pipefusion_parallel_degree,
             "--tensor_parallel_degree": config.tensor_parallel_degree,
         }
-        named = ", ".join(
-            f"{flag} {value}" for flag, value in splitters.items() if value > 1
-        )
+        named = ", ".join(f"{flag} {value}" for flag, value in splitters.items() if value > 1)
         raise UnsupportedLoadContract(
             f"--memory_efficient_replicated_load conflicts with {named}: that degree already "
             "splits the weights, so there is no replicated copy to fill."
@@ -322,7 +322,13 @@ def assert_offload_is_compatible_with_format(
     requested_format: QuantizationFormat,
     selected_backend: QuantizationBackend,
 ) -> None:
-    """Refuse group offload with AITER FP4, which aborts the process instead of failing.
+    """Refuse CPU-offload contracts that AITER FP4 cannot honor safely.
+
+    Mixed FP4+FP6 still uses the inherited MXFP4 walker for its primary weights.
+    That walker derives the packing device from each source parameter, so every
+    CPU-offload mode leaves the primary weights on an unsupported CPU packing
+    path. Pure FP6 is different: its walker packs on the requested GPU and can
+    evict each packed leaf immediately, so it remains allowed.
 
     Group offloading moves a module's parameters between host and device around each
     call. AITER FP4 weights survive neither leg. With --group_offload_low_cpu_mem the
@@ -339,11 +345,25 @@ def assert_offload_is_compatible_with_format(
 
     if selected_backend is not QuantizationBackend.AITER:
         return
-    if requested_format not in (
-        QuantizationFormat.FP4,
-        QuantizationFormat.FP8_FP4,
-        QuantizationFormat.FP4_FP6,
-    ):
+    if requested_format is QuantizationFormat.FP4_FP6:
+        offload_flags = tuple(
+            flag
+            for flag in (
+                "enable_model_cpu_offload",
+                "enable_sequential_cpu_offload",
+                "enable_group_cpu_offload",
+            )
+            if getattr(config, flag, False)
+        )
+        if offload_flags:
+            named_flags = ", ".join(f"--{flag}" for flag in offload_flags)
+            raise UnsupportedLoadContract(
+                f"{named_flags} cannot be combined with FP4_FP6 on the AITER backend: "
+                "the primary MXFP4 packing path is unsupported when CPU offload keeps "
+                "its source weights on the host. Use pure FP6, or run FP4_FP6 without "
+                "CPU offload."
+            )
+    if requested_format not in (QuantizationFormat.FP4, QuantizationFormat.FP8_FP4):
         return
     if not getattr(config, "enable_group_cpu_offload", False):
         return
@@ -521,7 +541,11 @@ def select_runtime_quantization(
         )
 
     if use_int8 and (use_fp8 or use_fp4):
-        others = "FP8 + FP4" if (use_fp8 and use_fp4) else ("FP8" if use_fp8 else "FP4")
+        others = (
+            "FP8 + FP4"
+            if (use_fp8 and use_fp4)
+            else ("FP8" if use_fp8 else "FP4")
+        )
         raise UnsupportedLoadContract(f"INT8 cannot be combined with {others}")
     if use_fp6_only:
         return QuantizationFormat.FP6, QuantizationBackend.AITER

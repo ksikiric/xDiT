@@ -206,7 +206,8 @@ class QuantizationBackends:
             target
             for target in self.loader.quantization_plan.module_list()
             if not any(
-                module_path_is_covered(target, fp4_target) for fp4_target in fp4_targets
+                module_path_is_covered(target, fp4_target)
+                for fp4_target in fp4_targets
             )
         }
         is_torchao = assume_torchao_fp8 or (
@@ -286,7 +287,8 @@ class QuantizationBackends:
         fp4_targets = set(self.model.settings.fp4_gemm_module_list or ())
         return any(
             not any(
-                module_path_is_covered(target, fp4_target) for fp4_target in fp4_targets
+                module_path_is_covered(target, fp4_target)
+                for fp4_target in fp4_targets
             )
             for target in self.loader.quantization_plan.module_list()
         )
@@ -344,7 +346,9 @@ class QuantizationBackends:
         format_targets = self.format_targets_for(component_name)
         if format_targets:
             return self.format, format_targets
-        fp8_targets = tuple(self.loader.quantization_plan.targets_for(component_name))
+        fp8_targets = tuple(
+            self.loader.quantization_plan.targets_for(component_name)
+        )
         if not fp8_targets:
             return None, ()
         if self._format_value() == "fp4_fp6":

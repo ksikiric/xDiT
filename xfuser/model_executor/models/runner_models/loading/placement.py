@@ -29,12 +29,19 @@ def conversion_filter(module_path, excluded_paths, include_suffixes=None):
     """
 
     overlapping = tuple(
-        path for path in excluded_paths if module_paths_overlap(module_path, path)
+        path
+        for path in excluded_paths
+        if module_paths_overlap(module_path, path)
     )
-    if any(module_path_is_covered(module_path, path) for path in overlapping):
+    if any(
+        module_path_is_covered(module_path, path)
+        for path in overlapping
+    ):
         return False, None
     descendants = tuple(
-        path for path in overlapping if module_path_is_covered(path, module_path)
+        path
+        for path in overlapping
+        if module_path_is_covered(path, module_path)
     )
     if not descendants and not include_suffixes:
         return True, None
@@ -43,7 +50,10 @@ def conversion_filter(module_path, excluded_paths, include_suffixes=None):
         full_path = module_path if not fqn else f"{module_path}.{fqn}"
         if include_suffixes and not full_path.endswith(tuple(include_suffixes)):
             return False
-        return not any(module_path_is_covered(full_path, path) for path in descendants)
+        return not any(
+            module_path_is_covered(full_path, path)
+            for path in descendants
+        )
 
     return True, filter_fn
 
@@ -182,7 +192,8 @@ def setup_fp8_only_gemm_modules(loader, local_rank) -> None:
         name
         for name in loader.quantization_plan.module_list()
         if not any(
-            module_path_is_covered(name, fp4_module) for fp4_module in fp4_modules
+            module_path_is_covered(name, fp4_module)
+            for fp4_module in fp4_modules
         )
     ]
     if not fp8_only_modules:

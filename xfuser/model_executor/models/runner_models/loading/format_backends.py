@@ -189,12 +189,14 @@ def _probe_aiter_mxfp6_apis(
     if os.getenv("AITER_TRITON_ONLY", "0") == "1":
         return (
             False,
-            "AITER MXFP6 requires the ASM backend, but "
-            "AITER_TRITON_ONLY=1 disables ASM",
+            (
+                "AITER MXFP6 requires the ASM backend, but "
+                "AITER_TRITON_ONLY=1 disables ASM"
+            ),
         )
     try:
         module = import_module("aiter.ops.gemm_op_a6w6")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - report every capability probe failure
         return (
             False,
             f"AITER MXFP6 import probe failed: {type(exc).__name__}: {exc}",
@@ -210,7 +212,7 @@ def _probe_aiter_mxfp6_apis(
         if not callable(getattr(module, name, None)):
             return (
                 False,
-                "missing required AITER MXFP6 API: " f"aiter.ops.gemm_op_a6w6.{name}",
+                f"missing required AITER MXFP6 API: aiter.ops.gemm_op_a6w6.{name}",
             )
 
     arch = (gcn_arch_probe or _gcn_arch_name)()

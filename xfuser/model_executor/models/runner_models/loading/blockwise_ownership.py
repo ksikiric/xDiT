@@ -52,8 +52,9 @@ def record_blockwise_ownership(
 ):
     """Log the plan and record what it will have quantized by the time the fill finishes.
 
-    ``fp8_targets`` and ``mxfp6_targets`` describe the component's
-    higher-precision remainder, needed only for the FP4 case below.
+    ``fp8_targets`` are the component's FP8 targets, needed only for the FP4 case below, so a
+    caller that is not running FP4 gemms need not look them up. ``mxfp6_targets`` describes the
+    corresponding MXFP6 remainder in mixed mode.
     """
     log(descriptor.log_message())
     is_fp8 = adapter.format.value == "fp8"
@@ -65,12 +66,11 @@ def record_blockwise_ownership(
     # An fp4 blockwise fill also converts the fp8 remainder its adapter leaves behind, so those
     # targets are owned too even though they are not the ones the descriptor names.
     if descriptor.materialization_mode == "blockwise" and fp4_gemms:
-        if fp8_targets:
-            ledger.record_streamed(
-                component_name,
-                blockwise_owned_targets(tuple(fp8_targets), wrap_attrs),
-                fp8=True,
-            )
+        ledger.record_streamed(
+            component_name,
+            blockwise_owned_targets(tuple(fp8_targets), wrap_attrs),
+            fp8=True,
+        )
         if mxfp6_targets:
             ledger.record_streamed(
                 component_name,
