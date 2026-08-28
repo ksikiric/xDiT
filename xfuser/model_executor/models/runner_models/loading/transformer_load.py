@@ -99,15 +99,13 @@ def _prepare_native_load(
             # broader coverage than was requested.
             stream_quant=(
                 stream_quant
-                and not getattr(
-                    model.settings, "fp8_gemm_include_suffixes", None
-                )
+                and not getattr(model.settings, "fp8_gemm_include_suffixes", None)
             ),
             model_factory=model_factory,
         )
     from .format_backends import prepare_native_transformer_format_load
 
-    is_fp4 = adapter.format.value in {"fp4", "fp8_fp4"}
+    is_fp4 = adapter.format.value in {"fp4", "fp8_fp4", "fp4_fp6"}
     return prepare_native_transformer_format_load(
         adapter,
         component_name=component_name,
@@ -117,9 +115,7 @@ def _prepare_native_load(
             (model.settings.fp8_precision_overrides or ()) if is_fp4 else ()
         ),
         precision_suffixes=(
-            (model.settings.fp8_precision_override_suffixes or ())
-            if is_fp4
-            else ()
+            (model.settings.fp8_precision_override_suffixes or ()) if is_fp4 else ()
         ),
         hybrid=(model.config.use_hybrid_gemm_schedule if is_fp4 else False),
         model_factory=model_factory,
@@ -127,15 +123,20 @@ def _prepare_native_load(
 
 
 def _fp4_remainder(loader, component_name):
-    """An FP4 blockwise fill also owns the FP8 remainder, whose targets it must be told."""
+    """Tell an FP4 block fill which higher-precision remainder it also owns."""
 
-    if not loader.model.config.use_fp4_gemms:
+    if not loader.model.config.use_fp4_gemms or getattr(
+        loader.model.config, "use_fp6_only", False
+    ):
         return {}
+    remainder_key = (
+        "mxfp6_targets"
+        if getattr(loader.model.config, "use_fp6_gemms", False)
+        else "fp8_targets"
+    )
     return {
         "fp4_gemms": True,
-        "fp8_targets": tuple(
-            loader.quantization_plan.targets_for(component_name)
-        ),
+        remainder_key: tuple(loader.quantization_plan.targets_for(component_name)),
     }
 
 
@@ -240,9 +241,7 @@ def load_transformer(
                 f"{component_name} uses a mapped checkpoint source but "
                 f"cannot enter local blockwise loading: {reason}"
             )
-        _record_native_quantization(
-            ledger, adapter, component_name, prepared, targets
-        )
+        _record_native_quantization(ledger, adapter, component_name, prepared, targets)
         quantization_config = prepared.quantization_config
 
     load_kwargs = request.from_pretrained_kwargs()
