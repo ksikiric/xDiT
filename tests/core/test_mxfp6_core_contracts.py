@@ -131,7 +131,7 @@ def test_runner_cannot_declare_fp6_without_the_fp4_setup_capability(modules):
     )
 
 
-def test_core_declares_fp6_capabilities_and_targets_without_opting_models_in():
+def test_core_declares_fp6_capabilities_and_limits_opt_in_to_audited_wan():
     base_path = ROOT / "xfuser/model_executor/models/runner_models/base_model.py"
     tree = ast.parse(base_path.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
@@ -148,24 +148,39 @@ def test_core_declares_fp6_capabilities_and_targets_without_opting_models_in():
     assert {"use_fp6_gemms", "use_fp6_only"} <= capability_fields
     assert "fp6_gemm_module_list" in setting_fields
 
-    opted_in = []
+    opted_in = set()
     runners = ROOT / "xfuser/model_executor/models/runner_models"
     for path in runners.glob("*.py"):
-        for call in (
+        classes = (
             node
-            for node in ast.walk(ast.parse(path.read_text()))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "ModelCapabilities"
-        ):
-            for keyword in call.keywords:
-                if (
-                    keyword.arg in {"use_fp6_gemms", "use_fp6_only"}
-                    and isinstance(keyword.value, ast.Constant)
-                    and keyword.value.value is True
-                ):
-                    opted_in.append(f"{path.name}:{keyword.arg}")
-    assert not opted_in
+            for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.ClassDef)
+        )
+        for class_node in classes:
+            for call in (
+                node
+                for node in ast.walk(class_node)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ModelCapabilities"
+            ):
+                for keyword in call.keywords:
+                    if (
+                        keyword.arg in {"use_fp6_gemms", "use_fp6_only"}
+                        and isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is True
+                    ):
+                        opted_in.add(f"{path.name}:{class_node.name}:{keyword.arg}")
+    assert opted_in == {
+        f"wan.py:{class_name}:{flag}"
+        for class_name in (
+            "xFuserWan21I2VModel",
+            "xFuserWan22DistilledI2VModel",
+            "xFuserWan21T2VModel",
+            "xFuserWan22TI2VModel",
+        )
+        for flag in ("use_fp6_gemms", "use_fp6_only")
+    }
 
 
 @pytest.mark.parametrize(
