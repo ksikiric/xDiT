@@ -194,9 +194,10 @@ class LoadDeclaration:
                 }
             )
         supports_fp4 = getattr(model_capabilities, "use_fp4_gemms", False)
-        if supports_fp4 and getattr(model_capabilities, "use_fp6_only", False):
+        supports_fp6 = getattr(model_capabilities, "use_fp6_gemms", False)
+        if supports_fp6:
             contracts.add((QuantizationFormat.FP6, QuantizationBackend.AITER))
-        if supports_fp4 and getattr(model_capabilities, "use_fp6_gemms", False):
+        if supports_fp4 and supports_fp6:
             contracts.add((QuantizationFormat.FP4_FP6, QuantizationBackend.AITER))
         if getattr(model_capabilities, "use_int8_gemms", False):
             contracts.add((QuantizationFormat.INT8, QuantizationBackend.TORCHAO))
@@ -510,32 +511,21 @@ def select_runtime_quantization(
     use_fp8 = bool(getattr(config, "use_fp8_gemms", False))
     use_fp4 = bool(getattr(config, "use_fp4_gemms", False))
     use_int8 = bool(getattr(config, "use_int8_gemms", False))
-    use_fp6_mixed = bool(getattr(config, "use_fp6_gemms", False))
-    use_fp6_only = bool(getattr(config, "use_fp6_only", False))
+    use_fp6 = bool(getattr(config, "use_fp6_gemms", False))
     hybrid = bool(getattr(config, "use_hybrid_gemm_schedule", False))
 
-    if use_fp6_mixed and use_fp6_only:
-        raise UnsupportedLoadContract(
-            "FP4+FP6 and pure FP6 modes cannot be selected together"
-        )
-    fp6_mode = use_fp6_mixed or use_fp6_only
-    if fp6_mode and not use_fp4:
-        mode = "FP4+FP6" if use_fp6_mixed else "pure FP6"
-        raise UnsupportedLoadContract(
-            f"{mode} requires the FP4 setup contract (--use_fp4_gemms)"
-        )
-    if fp6_mode and use_fp8:
+    if use_fp6 and use_fp8:
         raise UnsupportedLoadContract(
             "FP8 cannot be combined with an FP6 mode; FP6 owns the declared "
             "FP8 targets"
         )
-    if fp6_mode and use_int8:
+    if use_fp6 and use_int8:
         raise UnsupportedLoadContract("INT8 cannot be combined with an FP6 mode")
-    if fp6_mode and hybrid:
+    if use_fp6 and hybrid:
         raise UnsupportedLoadContract(
             "the hybrid FP8/FP4 GEMM schedule cannot be combined with an FP6 mode"
         )
-    if fp6_mode and cuda_active:
+    if use_fp6 and cuda_active:
         raise UnsupportedLoadContract(
             "AITER MXFP6 requires ROCm gfx950; CUDA is not supported"
         )
@@ -547,10 +537,9 @@ def select_runtime_quantization(
             else ("FP8" if use_fp8 else "FP4")
         )
         raise UnsupportedLoadContract(f"INT8 cannot be combined with {others}")
-    if use_fp6_only:
-        return QuantizationFormat.FP6, QuantizationBackend.AITER
-    if use_fp6_mixed:
-        return QuantizationFormat.FP4_FP6, QuantizationBackend.AITER
+    if use_fp6:
+        format_ = QuantizationFormat.FP4_FP6 if use_fp4 else QuantizationFormat.FP6
+        return format_, QuantizationBackend.AITER
     if use_fp8 and use_fp4:
         format_ = QuantizationFormat.FP8_FP4
     elif use_fp8:

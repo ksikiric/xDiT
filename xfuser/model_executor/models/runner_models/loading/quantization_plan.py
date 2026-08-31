@@ -68,11 +68,10 @@ class QuantizationPlan:
         settings = self.model.settings
         prefixes = settings.fp8_precision_overrides
         suffixes = settings.fp8_precision_override_suffixes
-        if getattr(self.model.config, "use_fp6_only", False):
+        use_fp6 = bool(getattr(self.model.config, "use_fp6_gemms", False))
+        if use_fp6 and not self.model.config.use_fp4_gemms:
             return
-        override_format = (
-            "MXFP6" if getattr(self.model.config, "use_fp6_gemms", False) else "FP8"
-        )
+        override_format = "MXFP6" if use_fp6 else "FP8"
         if prefixes:
             log(
                 f"The following layers will be quantized to {override_format}, "

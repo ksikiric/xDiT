@@ -129,9 +129,7 @@ def _prepare_native_load(
 def _fp4_remainder(loader, component_name):
     """Tell an FP4 block fill which higher-precision remainder it also owns."""
 
-    if not loader.model.config.use_fp4_gemms or getattr(
-        loader.model.config, "use_fp6_only", False
-    ):
+    if not loader.model.config.use_fp4_gemms:
         return {}
     remainder_key = (
         "mxfp6_targets"

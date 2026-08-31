@@ -168,6 +168,7 @@ Individual model classes that inherit from `xFuserModel`:
 | `--use_fp8_gemms` | Enable FP8 GEMM quantization for the transformer | False |
 | `--use_fp8_text_encoder` | Extend FP8 quantization to the text encoder as well (requires `--use_fp8_gemms`). Frees several GB for models with large bf16 text encoders. | False |
 | `--use_fp4_gemms` | Enable FP4 GEMM quantization for declared transformer targets (ROCm MXFP4 or CUDA NVFP4) | False |
+| `--use_fp6_gemms` | Enable AITER MXFP6 GEMMs on supported ROCm models. Alone, all declared FP4/FP8 transformer targets use MXFP6; with `--use_fp4_gemms`, MXFP4 remains primary and MXFP6 replaces its FP8 overrides and FP8-only targets. | False |
 | `--use_hybrid_gemm_schedule` | Enable the explicit FP8/FP4 hybrid schedule. Requires `--use_fp4_gemms`; also required when `--use_fp8_gemms` and `--use_fp4_gemms` are both set. | False |
 | `--use_int8_gemms` | Enable torchao W8A8 INT8 quantization for declared transformer targets. Cannot be combined with FP8, FP4, or hybrid FP8/FP4 mode. | False |
 | `--enable_tiling` | Enable VAE tiling | False |
@@ -200,6 +201,14 @@ apply on top of whatever a row allows.
 | CUDA capability 10.0+ (Blackwell) | torchao FP8 | torchao NVFP4 with dynamic per-tensor activation scaling; native Diffusers streams the NVFP4 leaves while explicit FP8 overrides stay full precision for post-load FP8 conversion; hybrid ownership is excluded | torchao W8A8 INT8; native streaming preserves the target and minimum-size exclusions |
 | CUDA capability 8.9 through 9.x | torchao FP8 | Excluded: NVFP4 requires capability 10.0+ | torchao W8A8 INT8; native streaming where accepted |
 | CUDA capability below 8.9 | Excluded: rejected in backend preflight before allocation | Excluded: NVFP4 requires capability 10.0+ | torchao W8A8 INT8; whether the kernels run stays hardware-dependent |
+
+MXFP6 GEMMs have a narrower backend envelope than the formats in the table:
+they require ROCm `gfx950` and an AITER build exposing
+`aiter.ops.gemm_op_a6w6` with `quant_mxfp6_gemm`,
+`quant_mxfp6_gemm_out`, `mxfp6_gemm_pack_size`, and `gemm_a6w6`.
+`AITER_TRITON_ONLY=1` disables the required ASM backend. The audited Wan
+2.1/2.2 I2V and T2V runners, Wan 2.2 distilled I2V, and Wan 2.2 TI2V support
+both pure MXFP6 and mixed MXFP4+MXFP6; Wan VACE does not.
 
 INT8 uses per-row symmetric scaling and skips linear layers smaller than 512 in
 either dimension. To keep the declared targets and that 512 minimum while
@@ -302,6 +311,8 @@ list rather than adding to it.
 - `--use_fp8_text_encoder` requires `--use_fp8_gemms` and a runner that explicitly declares text-encoder FP8 capability and targets. Other runners reject the text-encoder flag during capability validation. Quantizing a supported text encoder may reduce text-conditioning quality.
 - RDNA4+AITER streaming FP8 for a text encoder requires `transformers>=5.0` with `transformers.core_model_loading`. On Transformers 4.x, xDiT logs the reason and uses AITER post-load conversion where placement permits it; memory-efficient FSDP rejects the fallback before allocation because its sharded meta layout cannot be changed safely. The general `transformers>=4.39.1` package floor remains valid.
 - Native torchao text-encoder loading requires `torchao>=0.15.0`, Diffusers `PipelineQuantizationConfig`, and Transformers `TorchAoConfig` quantize-on-load APIs. Native torchao transformer loading separately requires Diffusers `TorchAoConfig` accepting the exact `AOBaseConfig`; this includes NVFP4 and INT8 when installed APIs support them. These APIs are feature-probed lazily and unavailable paths fall back explicitly where placement permits it.
+- `--use_fp6_gemms` alone routes the union of each runner's declared FP4 and FP8 transformer targets to MXFP6. Combining it with `--use_fp4_gemms` keeps MXFP4 as the primary format and gives MXFP6 ownership of precision overrides and FP8-only targets.
+- `--use_fp6_gemms` cannot be combined with `--use_fp8_gemms`, `--use_int8_gemms`, or `--use_hybrid_gemm_schedule`. Pure MXFP6 supports the existing CPU-offload modes by packing each layer on GPU before eviction; mixed MXFP4+MXFP6 rejects CPU offload because the primary MXFP4 path cannot pack host-resident source weights.
 - `--use_int8_gemms` cannot be combined with `--use_fp8_gemms` or `--use_fp4_gemms`, and that exclusion includes explicit hybrid FP8/FP4 mode.
 - Setting `--use_fp8_gemms` and `--use_fp4_gemms` together requires `--use_hybrid_gemm_schedule`; the generic combination is rejected. The hybrid FP4 path owns its FP8 high-precision conversion, so the generic FP8 traversal does not run afterward. Model-selected quality overrides and FP8-only components remain FP8. Use the FP8 precision-override flags only with FP4.
 - `--memory_efficient_sharding` requires `--fully_shard_degree > 1`. It is a sharded load: rank 0 reads one block at a time and broadcasts it within the FSDP group before each rank receives its shard.
@@ -361,6 +372,23 @@ CUDA Blackwell NVFP4:
 xdit --model FLUX.2-dev \
     --prompt "A studio photograph of a glass sculpture" \
     --use_fp4_gemms
+```
+
+ROCm gfx950 pure MXFP6:
+
+```bash
+xdit --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A studio photograph of a glass sculpture" \
+    --use_fp6_gemms
+```
+
+ROCm gfx950 mixed MXFP4+MXFP6:
+
+```bash
+xdit --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A studio photograph of a glass sculpture" \
+    --use_fp4_gemms \
+    --use_fp6_gemms
 ```
 
 These examples show how the flags are wired, not tuned recommendations: output quality, peak memory, and kernel availability depend on the checkpoint, the GPU, the torch/torchao/AITER versions, and the parallel layout.

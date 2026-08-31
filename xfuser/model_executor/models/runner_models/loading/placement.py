@@ -87,6 +87,8 @@ def place_pipeline_components(loader) -> None:
             setup_nvfp4_gemms(loader, local_rank)
         else:
             setup_mxfp4_gemms(loader, local_rank)
+    elif getattr(model.config, "use_fp6_gemms", False):
+        setup_mxfp6_gemms(loader, local_rank)
 
     # FP4 setup owns its own hybrid FP8 path and any declared FP8-only modules, so the generic walk
     # would re-quantize inside the hybrid wrappers it just built.
@@ -102,16 +104,21 @@ def place_pipeline_components(loader) -> None:
 
 
 def setup_mxfp4_gemms(loader, local_rank) -> None:
-    """Quantize the FP4 modules to MXFP4, the format ROCm runs."""
-    _setup_fp4_gemms(loader, local_rank, stream_quant=True)
+    """Apply the selected ROCm MXFP4 conversion plan."""
+    _setup_format_gemms(loader, local_rank, stream_quant=True)
+
+
+def setup_mxfp6_gemms(loader, local_rank) -> None:
+    """Quantize the selected ROCm targets to MXFP6."""
+    _setup_format_gemms(loader, local_rank, stream_quant=True)
 
 
 def setup_nvfp4_gemms(loader, local_rank) -> None:
     """Quantize the FP4 modules to NVFP4, the format CUDA runs."""
-    _setup_fp4_gemms(loader, local_rank, stream_quant=False)
+    _setup_format_gemms(loader, local_rank, stream_quant=False)
 
 
-def _setup_fp4_gemms(loader, local_rank, *, stream_quant) -> None:
+def _setup_format_gemms(loader, local_rank, *, stream_quant) -> None:
     model = loader.model
     adapter = loader.backends.format
     format_entries = getattr(loader.backends, "format_entries", None)
@@ -120,8 +127,9 @@ def _setup_fp4_gemms(loader, local_rank, *, stream_quant) -> None:
         if callable(format_entries)
         else tuple(model.settings.fp4_gemm_module_list or ())
     )
-    pure_fp6 = bool(getattr(model.config, "use_fp6_only", False))
-    mixed_fp6 = bool(getattr(model.config, "use_fp6_gemms", False))
+    use_fp6 = bool(getattr(model.config, "use_fp6_gemms", False))
+    pure_fp6 = use_fp6 and not model.config.use_fp4_gemms
+    mixed_fp6 = use_fp6 and model.config.use_fp4_gemms
     offload_requested = any(
         getattr(model.config, name, False)
         for name in (
@@ -186,7 +194,10 @@ def setup_fp8_only_gemm_modules(loader, local_rank) -> None:
 
     model = loader.model
     config = getattr(model, "config", None)
-    mixed_fp6 = bool(getattr(config, "use_fp6_gemms", False))
+    mixed_fp6 = bool(
+        getattr(config, "use_fp6_gemms", False)
+        and getattr(config, "use_fp4_gemms", False)
+    )
     fp4_modules = set(loader.quantization_plan.module_list("fp4"))
     fp8_only_modules = [
         name

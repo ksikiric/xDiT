@@ -150,11 +150,9 @@ class xFuserArgs:
     use_fp8_gemms: bool = False
     use_fp8_text_encoder: bool = False
     use_fp4_gemms: bool = False
-    # Keep AITER MXFP4 as the primary format, but replace its FP8
-    # precision overrides and FP8-only module targets with AITER MXFP6.
+    # Alone, route the runner's FP4/FP8 target union to AITER MXFP6. With
+    # use_fp4_gemms, keep MXFP4 primary and use MXFP6 for its remainders.
     use_fp6_gemms: bool = False
-    # Route the union of a runner's FP4 and FP8 transformer targets to MXFP6.
-    use_fp6_only: bool = False
     fp8_precision_override_prefix_patterns: Optional[str] = None
     fp8_precision_override_suffix_patterns: Optional[str] = None
     # Model runner specific
@@ -804,18 +802,10 @@ class xFuserArgs:
             "--use_fp6_gemms",
             action="store_true",
             help=(
-                "With --use_fp4_gemms on supported ROCm models, keep AITER "
-                "MXFP4 as primary and replace FP8 precision overrides and "
-                "FP8-only transformer targets with AITER MXFP6."
-            ),
-        )
-        parser.add_argument(
-            "--use_fp6_only",
-            action="store_true",
-            help=(
-                "With --use_fp4_gemms on supported ROCm models, quantize the "
-                "union of declared FP4 and FP8 transformer targets to AITER "
-                "MXFP6."
+                "On supported ROCm models, quantize the declared transformer "
+                "targets to AITER MXFP6. Combine with --use_fp4_gemms to keep "
+                "MXFP4 primary and replace its FP8 precision overrides and "
+                "FP8-only targets with MXFP6."
             ),
         )
         parser.add_argument(
@@ -1105,32 +1095,21 @@ class xFuserArgs:
 
     def _validate_gemm_quantization_flags(self) -> None:
         """Validate ownership of mutually exclusive generic GEMM quantizers."""
-        if self.use_fp6_gemms and self.use_fp6_only:
+        if self.use_fp6_gemms and self.use_fp8_gemms:
             raise ValueError(
-                "--use_fp6_gemms and --use_fp6_only are mutually exclusive: "
-                "the first keeps MXFP4 primary while the second replaces it."
+                "--use_fp8_gemms cannot be combined with --use_fp6_gemms; "
+                "MXFP6 already owns every declared FP8 target."
             )
-        fp6_mode = self.use_fp6_gemms or self.use_fp6_only
-        if fp6_mode and self.use_fp8_gemms:
+        if self.use_fp6_gemms and self.use_int8_gemms:
             raise ValueError(
-                "--use_fp8_gemms cannot be combined with --use_fp6_gemms or "
-                "--use_fp6_only; MXFP6 already owns every declared FP8 target "
-                "in those modes."
+                "--use_int8_gemms cannot be combined with --use_fp6_gemms."
             )
-        if fp6_mode and self.use_int8_gemms:
-            raise ValueError(
-                "--use_int8_gemms cannot be combined with --use_fp6_gemms or "
-                "--use_fp6_only."
-            )
-        if fp6_mode and self.use_hybrid_gemm_schedule:
+        if self.use_fp6_gemms and self.use_hybrid_gemm_schedule:
             raise ValueError(
                 "--use_hybrid_gemm_schedule cannot be combined with "
-                "--use_fp6_gemms or --use_fp6_only; the schedule requires an "
-                "FP8 high-precision branch."
+                "--use_fp6_gemms; the schedule requires an FP8 "
+                "high-precision branch."
             )
-        if fp6_mode and not self.use_fp4_gemms:
-            flag = "--use_fp6_gemms" if self.use_fp6_gemms else "--use_fp6_only"
-            raise ValueError(f"{flag} requires --use_fp4_gemms.")
         if self.use_int8_gemms and (self.use_fp8_gemms or self.use_fp4_gemms):
             raise ValueError(
                 "--use_int8_gemms cannot be combined with --use_fp8_gemms or "

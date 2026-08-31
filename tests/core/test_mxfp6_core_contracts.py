@@ -30,9 +30,8 @@ def modules():
 def _config(**overrides):
     values = {
         "use_fp8_gemms": False,
-        "use_fp4_gemms": True,
+        "use_fp4_gemms": False,
         "use_fp6_gemms": False,
-        "use_fp6_only": False,
         "use_int8_gemms": False,
         "use_hybrid_gemm_schedule": False,
     }
@@ -43,8 +42,8 @@ def _config(**overrides):
 @pytest.mark.parametrize(
     ("flags", "expected_format"),
     [
-        ({"use_fp6_gemms": True}, "FP4_FP6"),
-        ({"use_fp6_only": True}, "FP6"),
+        ({"use_fp6_gemms": True}, "FP6"),
+        ({"use_fp4_gemms": True, "use_fp6_gemms": True}, "FP4_FP6"),
     ],
 )
 def test_runtime_selects_explicit_aiter_only_fp6_contracts(
@@ -70,7 +69,11 @@ def test_runtime_selects_explicit_aiter_only_fp6_contracts(
 )
 def test_mixed_fp4_fp6_rejects_every_cpu_offload_mode(modules, offload_flag):
     contracts = modules.contracts
-    config = _config(use_fp6_gemms=True, **{offload_flag: True})
+    config = _config(
+        use_fp4_gemms=True,
+        use_fp6_gemms=True,
+        **{offload_flag: True},
+    )
 
     with pytest.raises(contracts.UnsupportedLoadContract) as refusal:
         contracts.assert_offload_is_compatible_with_format(
@@ -94,7 +97,7 @@ def test_mixed_fp4_fp6_rejects_every_cpu_offload_mode(modules, offload_flag):
 )
 def test_pure_fp6_does_not_reject_supported_cpu_offload_modes(modules, offload_flag):
     contracts = modules.contracts
-    config = _config(use_fp6_only=True, **{offload_flag: True})
+    config = _config(use_fp6_gemms=True, **{offload_flag: True})
 
     contracts.assert_offload_is_compatible_with_format(
         config,
@@ -106,16 +109,14 @@ def test_pure_fp6_does_not_reject_supported_cpu_offload_modes(modules, offload_f
 @pytest.mark.parametrize(
     ("flags", "cuda", "reason"),
     [
-        ({"use_fp6_gemms": True, "use_fp6_only": True}, False, "together"),
-        ({"use_fp4_gemms": False, "use_fp6_only": True}, False, "requires"),
         ({"use_fp6_gemms": True, "use_fp8_gemms": True}, False, "FP8"),
         ({"use_fp6_gemms": True, "use_int8_gemms": True}, False, "INT8"),
         (
-            {"use_fp6_only": True, "use_hybrid_gemm_schedule": True},
+            {"use_fp6_gemms": True, "use_hybrid_gemm_schedule": True},
             False,
             "hybrid",
         ),
-        ({"use_fp6_only": True}, True, "CUDA"),
+        ({"use_fp6_gemms": True}, True, "CUDA"),
     ],
 )
 def test_runtime_rejects_ambiguous_or_unsafe_fp6_combinations(
@@ -135,7 +136,6 @@ def test_runner_declaration_keeps_fp6_pairs_aiter_only(modules):
         use_fp8_gemms=False,
         use_fp4_gemms=True,
         use_fp6_gemms=True,
-        use_fp6_only=True,
         use_int8_gemms=False,
     )
 
@@ -156,21 +156,22 @@ def test_runner_declaration_keeps_fp6_pairs_aiter_only(modules):
     ) not in declaration.quantization_contracts
 
 
-def test_runner_cannot_declare_fp6_without_the_fp4_setup_capability(modules):
+def test_runner_without_fp4_capability_declares_only_pure_fp6(modules):
     c = modules.contracts
     declaration = c.LoadDeclaration.for_runner(
         SimpleNamespace(
             use_fp8_gemms=False,
             use_fp4_gemms=False,
             use_fp6_gemms=True,
-            use_fp6_only=True,
             use_int8_gemms=False,
         )
     )
 
-    assert all(
-        format_ not in {c.QuantizationFormat.FP6, c.QuantizationFormat.FP4_FP6}
-        for format_, _backend in declaration.quantization_contracts
+    assert (c.QuantizationFormat.FP6, c.QuantizationBackend.AITER) in (
+        declaration.quantization_contracts
+    )
+    assert (c.QuantizationFormat.FP4_FP6, c.QuantizationBackend.AITER) not in (
+        declaration.quantization_contracts
     )
 
 
@@ -188,7 +189,8 @@ def test_core_declares_fp6_capabilities_and_limits_opt_in_to_audited_wan():
         for node in classes["ModelSettings"].body
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
     }
-    assert {"use_fp6_gemms", "use_fp6_only"} <= capability_fields
+    assert "use_fp6_gemms" in capability_fields
+    assert "use_fp6_only" not in capability_fields
     assert "fp6_gemm_module_list" in setting_fields
 
     opted_in = set()
@@ -209,20 +211,19 @@ def test_core_declares_fp6_capabilities_and_limits_opt_in_to_audited_wan():
             ):
                 for keyword in call.keywords:
                     if (
-                        keyword.arg in {"use_fp6_gemms", "use_fp6_only"}
+                        keyword.arg == "use_fp6_gemms"
                         and isinstance(keyword.value, ast.Constant)
                         and keyword.value.value is True
                     ):
                         opted_in.add(f"{path.name}:{class_node.name}:{keyword.arg}")
     assert opted_in == {
-        f"wan.py:{class_name}:{flag}"
+        f"wan.py:{class_name}:use_fp6_gemms"
         for class_name in (
             "xFuserWan21I2VModel",
             "xFuserWan22DistilledI2VModel",
             "xFuserWan21T2VModel",
             "xFuserWan22TI2VModel",
         )
-        for flag in ("use_fp6_gemms", "use_fp6_only")
     }
 
 
@@ -391,18 +392,18 @@ def test_cli_fp6_flags_validate_before_model_initialization():
     parser = xFuserArgs.add_runner_args(
         FlexibleArgumentParser(description="MXFP6 CLI test")
     )
-    parsed = parser.parse_args(
-        ["--model", "test/model", "--use_fp4_gemms", "--use_fp6_only"]
-    )
-    assert parsed.use_fp4_gemms is True
-    assert parsed.use_fp6_gemms is False
-    assert parsed.use_fp6_only is True
+    parsed = parser.parse_args(["--model", "test/model", "--use_fp6_gemms"])
+    assert parsed.use_fp4_gemms is False
+    assert parsed.use_fp6_gemms is True
+    assert not hasattr(parsed, "use_fp6_only")
 
-    with pytest.raises(ValueError, match="requires --use_fp4_gemms"):
-        xFuserArgs(use_fp6_gemms=True)._validate_gemm_quantization_flags()
-    with pytest.raises(ValueError, match="mutually exclusive"):
+    xFuserArgs(use_fp6_gemms=True)._validate_gemm_quantization_flags()
+    xFuserArgs(
+        use_fp4_gemms=True,
+        use_fp6_gemms=True,
+    )._validate_gemm_quantization_flags()
+    with pytest.raises(ValueError, match="cannot be combined"):
         xFuserArgs(
-            use_fp4_gemms=True,
             use_fp6_gemms=True,
-            use_fp6_only=True,
+            use_fp8_gemms=True,
         )._validate_gemm_quantization_flags()

@@ -132,7 +132,6 @@ class ModelCapabilities:
     use_fp8_text_encoder: bool = False
     use_fp4_gemms: bool = False
     use_fp6_gemms: bool = False
-    use_fp6_only: bool = False
     supports_step_caching: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
@@ -557,14 +556,13 @@ class xFuserModel(abc.ABC):
         if config.use_int8_gemms and _is_hip():
             raise ValueError("Int8 GEMMs on ROCm are not supported.")
             
-        if (config.use_fp6_gemms or config.use_fp6_only) and _is_cuda():
-            flag = "--use_fp6_gemms" if config.use_fp6_gemms else "--use_fp6_only"
+        if config.use_fp6_gemms and _is_cuda():
             raise ValueError(
-                f"{flag} requires the AITER MXFP6 ASM backend on ROCm gfx950; "
+                "--use_fp6_gemms requires the AITER MXFP6 ASM backend on ROCm gfx950; "
                 "CUDA is not supported."
             )
         if (
-            (config.use_fp6_gemms or config.use_fp6_only)
+            config.use_fp6_gemms
             and _is_hip()
             and not packages_info.get("has_aiter", False)
         ):

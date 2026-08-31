@@ -221,3 +221,38 @@ def test_explicit_hybrid_fp4_owns_conversion_without_generic_fp8_walk(
         ("fp4", 0),
         ("schedule", {"num_inference_steps": 4}),
     ]
+
+
+def test_pure_fp6_dispatches_rocm_conversion_without_fp4_flag(runtime, monkeypatch):
+    calls = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_model_cpu_offload=False,
+            enable_sequential_cpu_offload=False,
+            enable_group_cpu_offload=False,
+            use_fp4_gemms=False,
+            use_fp6_gemms=True,
+            use_int8_gemms=False,
+        )
+    )
+    model.pipe = SimpleNamespace(to=lambda device: model.pipe)
+    loader = SimpleNamespace(
+        model=model,
+        fill_eager_transformers=lambda: None,
+        replicated_broadcast_load=lambda: False,
+        backends=SimpleNamespace(fp8=None),
+    )
+    monkeypatch.setattr(
+        runtime.placement,
+        "get_world_group",
+        lambda: SimpleNamespace(local_rank=3),
+    )
+    monkeypatch.setattr(
+        runtime.placement,
+        "setup_mxfp6_gemms",
+        lambda _loader, local_rank: calls.append(("fp6", local_rank)),
+    )
+
+    runtime.placement.place_pipeline_components(loader)
+
+    assert calls == [("fp6", 3)]

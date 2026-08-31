@@ -68,7 +68,6 @@ def _capabilities(class_name):
         use_fp8_gemms=_keyword(call, "use_fp8_gemms", False),
         use_fp4_gemms=_keyword(call, "use_fp4_gemms", False),
         use_fp6_gemms=_keyword(call, "use_fp6_gemms", False),
-        use_fp6_only=_keyword(call, "use_fp6_only", False),
         use_int8_gemms=_keyword(call, "use_int8_gemms", False),
         fully_shard_degree=_keyword(call, "fully_shard_degree", False),
     )
@@ -129,9 +128,7 @@ def test_wan21_t2v_effective_capabilities_are_the_final_declaration():
 
     assert len(declarations) == 2
     assert _keyword(declarations[0], "use_fp6_gemms") is None
-    assert _keyword(declarations[0], "use_fp6_only") is None
     assert _keyword(declarations[-1], "use_fp6_gemms") is True
-    assert _keyword(declarations[-1], "use_fp6_only") is True
 
 
 @pytest.mark.parametrize(

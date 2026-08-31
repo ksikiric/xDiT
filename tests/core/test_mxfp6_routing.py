@@ -57,10 +57,9 @@ def _settings():
 
 def _config(*, mixed=False, pure=False):
     return SimpleNamespace(
-        use_fp4_gemms=True,
+        use_fp4_gemms=not pure,
         use_fp8_gemms=False,
-        use_fp6_gemms=mixed,
-        use_fp6_only=pure,
+        use_fp6_gemms=mixed or pure,
         use_int8_gemms=False,
         use_fp8_text_encoder=False,
         use_hybrid_gemm_schedule=False,
@@ -200,7 +199,7 @@ def test_eager_pure_mode_routes_each_union_target_once(monkeypatch):
     loader, primary, fp6, fp8 = _loader(pure=True)
     monkeypatch.setattr(placement, "log", lambda message: None)
 
-    placement.setup_mxfp4_gemms(loader, local_rank=1)
+    placement.setup_mxfp6_gemms(loader, local_rank=1)
 
     assert [call[0] for call in primary.module_calls] == [
         loader.model.pipe.transformer.blocks,
@@ -279,7 +278,6 @@ def test_blockwise_mixed_ledger_records_fp6_remainder_as_format_owned(
 def test_no_fp6_flags_preserve_fp8_remainder_routing():
     loader, primary, fp6, fp8 = _loader()
     loader.model.config.use_fp6_gemms = False
-    loader.model.config.use_fp6_only = False
     loader.load_contract.requested_format = QuantizationFormat.FP4
 
     quantize = shard.build_block_quantize_fn(
