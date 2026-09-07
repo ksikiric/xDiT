@@ -269,6 +269,12 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
+            dump_dir = os.environ.get("XFUSER_LATENT_DUMP_DIR")
+            if dump_dir and int(os.environ.get("RANK", "0")) == 0:
+                os.makedirs(dump_dir, exist_ok=True)
+                fused_a2a = os.environ.get("XFUSER_FUSED_A2A", "0") or "0"
+                torch.save(latents.detach().cpu(),
+                           os.path.join(dump_dir, f"wan22-i2v-prevae-fused-a2a-{fused_a2a}.pt"))
             video = self.vae.decode(latents, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:

@@ -241,6 +241,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SAGE_V2,
                                  AttentionBackendType.AITER_SPARSE_SAGE_V2,
                                  AttentionBackendType.AITER_SPARGE_V2,
+                                 AttentionBackendType.AITER_SPARGE_FP8,
                                  AttentionBackendType.AITER_VSA,
                                  AttentionBackendType.AITER_FLYDSL,
                                  AttentionBackendType.AITER_FLYDSL_FP8,
@@ -383,6 +384,20 @@ class RuntimeState(metaclass=ABCMeta):
                     raise RuntimeError(msg) from None
             except ImportError:
                 raise RuntimeError(msg) from None
+        elif attention_backend == AttentionBackendType.AITER_SPARGE_FP8:
+            try:
+                from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+                from aiter.ops.mha import (
+                    flash_attn_fp8_sparse_pertensor_func,
+                    fmha_v3_fwd_fp8_sparse,
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "AITER Sparge ASM FP8 attention is not available; this backend "
+                    "needs the hand-written gfx950 .co (fwd_hd128_fp8_sparse.co) and "
+                    "aiter.ops.mha.fmha_v3_fwd_fp8_sparse (reached via "
+                    "flash_attn_fp8_sparse_pertensor_func)."
+                ) from None
         elif attention_backend == AttentionBackendType.AITER_VSA:
             try:
                 from aiter.ops.jenga_sparse_attention import vsa_sparse_attention

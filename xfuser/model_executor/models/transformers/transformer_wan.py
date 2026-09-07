@@ -11,9 +11,11 @@ from xfuser.model_executor.layers.usp import (
     USP,
     attention,
 )
+from xfuser.model_executor.layers.fused_a2a_integration import get_fused_a2a_mode
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
+    get_ulysses_parallel_world_size,
     get_sp_group,
     get_runtime_state,
 )
@@ -101,21 +103,52 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
 
         query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        # Collapse norm_q -> norm_k -> apply_rotary_emb(q) -> apply_rotary_emb(k)
-        # into a single FlyDSL kernel: inductor cannot fuse RoPE into the norm
-        # (the RMS reduction sits between them) and the reference RoPE writes
-        # through two stride-2 scatters, so the reference is four uncoalesced
-        # bandwidth-bound passes over a [1, S, H*D] bf16 tensor.  FlyDSL is used
-        # automatically when importable (no env flag, no Triton path); the entry
-        # self-falls-back to the diffusers reference for out-of-envelope shapes.
-        # value carries no norm/rope -- it just needs the head split.
-        if _HAS_FLYDSL and rotary_emb is not None:
-            query, key = fused_qk_norm_rope(
-                query, key, attn.norm_q, attn.norm_k, rotary_emb[0], rotary_emb[1], attn.heads
-            )
+        use_fused_a2a_full = (
+            get_fused_a2a_mode() == 2
+            and self.attention_function is USP
+            and not self.is_cross_attention
+            and get_ulysses_parallel_world_size() > 1
+        )
+        image_query = None
+        if use_fused_a2a_full:
+            if encoder_hidden_states_img is not None:
+                image_query = attn.norm_q(query).unflatten(2, (attn.heads, -1))
+                if rotary_emb is not None:
+
+                    def apply_rotary_emb(
+                        hidden_states: torch.Tensor,
+                        freqs_cos: torch.Tensor,
+                        freqs_sin: torch.Tensor,
+                    ):
+                        x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+                        cos = freqs_cos[..., 0::2]
+                        sin = freqs_sin[..., 1::2]
+                        out = torch.empty_like(hidden_states)
+                        out[..., 0::2] = x1 * cos - x2 * sin
+                        out[..., 1::2] = x1 * sin + x2 * cos
+                        return out.type_as(hidden_states)
+
+                    image_query = apply_rotary_emb(image_query, *rotary_emb)
+
+            query = query.unflatten(2, (attn.heads, -1))
+            key = key.unflatten(2, (attn.heads, -1))
             value = value.unflatten(2, (attn.heads, -1))
         else:
-            query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
+            # Collapse norm_q -> norm_k -> apply_rotary_emb(q) -> apply_rotary_emb(k)
+            # into a single FlyDSL kernel: inductor cannot fuse RoPE into the norm
+            # (the RMS reduction sits between them) and the reference RoPE writes
+            # through two stride-2 scatters, so the reference is four uncoalesced
+            # bandwidth-bound passes over a [1, S, H*D] bf16 tensor.  FlyDSL is used
+            # automatically when importable (no env flag, no Triton path); the entry
+            # self-falls-back to the diffusers reference for out-of-envelope shapes.
+            # value carries no norm/rope -- it just needs the head split.
+            if _HAS_FLYDSL and rotary_emb is not None:
+                query, key = fused_qk_norm_rope(
+                    query, key, attn.norm_q, attn.norm_k, rotary_emb[0], rotary_emb[1], attn.heads
+                )
+                value = value.unflatten(2, (attn.heads, -1))
+            else:
+                query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
 
         # I2V task
         hidden_states_img = None
@@ -126,7 +159,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
-            hidden_states_img = self.attention_function(query.transpose(1, 2),
+            image_query = query if image_query is None else image_query
+            hidden_states_img = self.attention_function(image_query.transpose(1, 2),
                                                         key_img.transpose(1, 2),
                                                         value_img.transpose(1, 2),
                                                         backend=backend,
@@ -136,14 +170,27 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states_img = hidden_states_img.type_as(query)
 
 
+        attention_call_kwargs = {
+            "backend": backend,
+            "attention_kwargs": self.attention_kwargs,
+            "head_balance_layer": attn,
+        }
+        if self.attention_function is USP:
+            attention_call_kwargs.update(
+                fused_a2a_enabled=True,
+                fused_a2a_norm_q=attn.norm_q.weight if use_fused_a2a_full else None,
+                fused_a2a_norm_k=attn.norm_k.weight if use_fused_a2a_full else None,
+                fused_a2a_rotary_emb=rotary_emb if use_fused_a2a_full else None,
+                fused_a2a_return_sequence_major=use_fused_a2a_full,
+            )
         hidden_states = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            backend=backend,
-            attention_kwargs=self.attention_kwargs,
-            head_balance_layer=attn,
-        ).transpose(1, 2)
+            **attention_call_kwargs,
+        )
+        if not use_fused_a2a_full:
+            hidden_states = hidden_states.transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)

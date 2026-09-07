@@ -32,6 +32,11 @@ from xfuser.core.sparge_attention.head_balance import (
     apply_head_balance,
     revert_head_balance,
 )
+from xfuser.model_executor.layers.fused_a2a_integration import (
+    fused_a2a_input,
+    fused_a2a_output,
+    get_fused_a2a_mode,
+)
 
 # Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
 # These all build a block mask via _build_sparge_block_mask and write the
@@ -40,6 +45,7 @@ from xfuser.core.sparge_attention.head_balance import (
 _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE,
     AttentionBackendType.AITER_SPARGE_V2,
+    AttentionBackendType.AITER_SPARGE_FP8,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
 }) | AITER_MHA_V4_SPARGE_BACKEND_SET
 
@@ -260,6 +266,11 @@ def USP(
         backend=None,
         attention_kwargs: dict | None = None,
         head_balance_layer=None,
+        fused_a2a_norm_q=None,
+        fused_a2a_norm_k=None,
+        fused_a2a_rotary_emb=None,
+        fused_a2a_return_sequence_major=False,
+        fused_a2a_enabled=False,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -303,8 +314,35 @@ def USP(
 
         }
 
+    fused_a2a_mode = get_fused_a2a_mode()
+    use_fused_a2a = (
+        fused_a2a_enabled
+        and fused_a2a_mode > 0
+        and not hb_applied
+        and get_ulysses_parallel_world_size() > 1
+        and joint_strategy is None
+        and query.shape == key.shape == value.shape
+    )
+    if fused_a2a_enabled and fused_a2a_mode == 2 and hb_applied:
+        raise ValueError("full-fusion A2A is incompatible with USP head balancing")
+
     if get_ulysses_parallel_world_size() > 1:
-        if combine_qkv_a2a and query.shape == key.shape == value.shape:
+        if use_fused_a2a:
+            cos = sin = None
+            if fused_a2a_rotary_emb is not None:
+                cos, sin = fused_a2a_rotary_emb
+            query, key, value = fused_a2a_input(
+                query,
+                key,
+                value,
+                PROCESS_GROUP.ULYSSES_PG,
+                get_ulysses_parallel_rank(),
+                fused_a2a_norm_q,
+                fused_a2a_norm_k,
+                cos,
+                sin,
+            )
+        elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
             query = _ft_c_input_all_to_all(query)
@@ -351,7 +389,15 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        out = _ft_c_output_all_to_all(out)
+        if use_fused_a2a:
+            out = fused_a2a_output(
+                out.contiguous(),
+                PROCESS_GROUP.ULYSSES_PG,
+                get_ulysses_parallel_rank(),
+                return_sequence_major=fused_a2a_return_sequence_major,
+            )
+        else:
+            out = _ft_c_output_all_to_all(out)
         if hb_applied:
             # Restore global head order on the output, gather this step's per-head
             # costs across the Ulysses group, and plan next step's permutation.
