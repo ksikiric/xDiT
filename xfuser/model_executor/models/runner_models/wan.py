@@ -374,6 +374,7 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
         return None  # full warmup cycle
 
 
+
 @register_model("Wan2.2-Distilled-I2V")
 class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
     """Wan2.2 I2V with LightX2V 4-step distilled weights.

@@ -7,6 +7,7 @@ import torch.distributed as dist
 
 
 _FUSED_A2A_MODE = int(os.environ.get("XFUSER_FUSED_A2A", "0"))
+_FUSED_A2A_QUANT = os.environ.get("FUSED_A2A_QUANT", "0") == "1"
 if _FUSED_A2A_MODE not in (0, 1, 2):
     raise ValueError("XFUSER_FUSED_A2A must be 0, 1, or 2")
 
@@ -74,6 +75,8 @@ def _get_ops(group, rank, shape, dtype, device):
             shape=shape,
             dtype=dtype,
             fuse_norm_rope=_FUSED_A2A_MODE == 2,
+            quant=_FUSED_A2A_QUANT,
+            return_mode="bf16" if _FUSED_A2A_QUANT else None,
         )
         out_op = FusedA2AOutIntraNodeOp(
             rank=rank,
@@ -133,6 +136,11 @@ def fused_a2a_output(output, group, rank, return_sequence_major=False):
     if not return_sequence_major:
         return head_major
     return head_major.transpose(1, 2).contiguous()
+
+
+# Raw-pointer kernel launches and MoRI uint8->int64 buffer views must stay outside Dynamo tracing for all fused modes.
+fused_a2a_input = torch.compiler.disable(fused_a2a_input)
+fused_a2a_output = torch.compiler.disable(fused_a2a_output)
 
 
 # Cached outputs are persistent symmetric buffers. A same-key launch is safe only

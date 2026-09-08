@@ -1,6 +1,9 @@
 # This file implements USP with torch version >= '2.5.0'
 import torch
 import functools
+import math
+import os
+from pathlib import Path
 
 import torch.distributed._functional_collectives as ft_c
 
@@ -48,6 +51,104 @@ _HEAD_BALANCE_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE_FP8,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
 }) | AITER_MHA_V4_SPARGE_BACKEND_SET
+
+_A2A_DIFF_ENABLED = os.environ.get("XFUSER_A2A_DIFF", "0") == "1"
+_A2A_DIFF_INPUT_CALLS = 0
+_A2A_DIFF_OUTPUT_CAPTURED = False
+_A2A_DIFF_LATE_CALL = 40
+
+
+def _a2a_diff_report(name, fused, reference, rank, hop, call, report_layout):
+    fused_f32 = fused.float()
+    reference_f32 = reference.float()
+    error = fused_f32 - reference_f32
+    ref_energy = torch.sum(reference_f32.square())
+    err_energy = torch.sum(error.square())
+    if err_energy == 0:
+        sqnr = float("inf")
+    elif ref_energy == 0:
+        sqnr = float("-inf")
+    else:
+        sqnr = 10.0 * math.log10((ref_energy / err_energy).item())
+    cosine = torch.nn.functional.cosine_similarity(
+        fused_f32.flatten(), reference_f32.flatten(), dim=0
+    ).item()
+    ref_mae = reference_f32.abs().mean().item()
+    rel_mae = error.abs().mean().item() / ref_mae if ref_mae else float("inf")
+    mismatches = (fused != reference).flatten().nonzero()
+    first_mismatch = mismatches[0].item() if mismatches.numel() else -1
+    if first_mismatch == -1:
+        multiset_match = True
+    else:
+        fused_sorted = torch.sort(fused_f32.flatten()).values
+        reference_sorted = torch.sort(reference_f32.flatten()).values
+        multiset_match = torch.equal(fused_sorted, reference_sorted)
+    prefix = f"[XFUSER_A2A_DIFF rank={rank} hop={hop} call={call}] {name}"
+    print(
+        f"{prefix}: max_abs_diff={error.abs().max().item():.9g} "
+        f"sqnr_db={sqnr:.9g} cosine={cosine:.9g} rel_mae={rel_mae:.9g} "
+        f"first_mismatch_flat_index={first_mismatch} "
+        f"sorted_multiset_match={multiset_match}",
+        flush=True,
+    )
+    if report_layout:
+        fused_stride = fused.stride()
+        reference_stride = reference.stride()
+        stride_diff_axes = [
+            axis
+            for axis, (lhs, rhs) in enumerate(zip(fused_stride, reference_stride))
+            if lhs != rhs
+        ]
+        print(
+            f"{prefix} layout: "
+            f"fused=(shape={tuple(fused.shape)}, stride={fused_stride}, "
+            f"storage_offset={fused.storage_offset()}, contiguous={fused.is_contiguous()}, "
+            f"dtype={fused.dtype}, alignment_mod256={fused.data_ptr() % 256}) "
+            f"reference=(shape={tuple(reference.shape)}, stride={reference_stride}, "
+            f"storage_offset={reference.storage_offset()}, "
+            f"contiguous={reference.is_contiguous()}, dtype={reference.dtype}, "
+            f"alignment_mod256={reference.data_ptr() % 256}) "
+            f"stride_diff_axes={stride_diff_axes} "
+            f"contiguity_diff={fused.is_contiguous() != reference.is_contiguous()}",
+            flush=True,
+        )
+
+
+def _run_a2a_input_diff(inputs, fused_outputs):
+    global _A2A_DIFF_INPUT_CALLS
+    if not _A2A_DIFF_ENABLED:
+        return
+    _A2A_DIFF_INPUT_CALLS += 1
+    call = _A2A_DIFF_INPUT_CALLS
+    if call not in (1, _A2A_DIFF_LATE_CALL):
+        return
+    rank = get_ulysses_parallel_rank()
+
+    # Mirror the normal RCCL path byte-for-byte so only the transport changes.
+    references = tuple(_ft_c_input_all_to_all(tensor) for tensor in inputs)
+    for name, fused, reference in zip(("q", "k", "v"), fused_outputs, references):
+        _a2a_diff_report(
+            name, fused, reference, rank, "input", call, report_layout=call == 1
+        )
+    if call == _A2A_DIFF_LATE_CALL:
+        torch.distributed.barrier(group=PROCESS_GROUP.ULYSSES_PG)
+        raise SystemExit(
+            f"XFUSER_A2A_DIFF rank={rank}: input call {call} capture complete"
+        )
+
+
+def _run_a2a_output_diff(output_input, fused_output):
+    global _A2A_DIFF_OUTPUT_CAPTURED
+    if not _A2A_DIFF_ENABLED or _A2A_DIFF_OUTPUT_CAPTURED:
+        return
+    _A2A_DIFF_OUTPUT_CAPTURED = True
+    rank = get_ulysses_parallel_rank()
+
+    # Mirror the normal RCCL output path byte-for-byte so only transport changes.
+    reference = _ft_c_output_all_to_all(output_input)
+    _a2a_diff_report(
+        "o", fused_output, reference, rank, "output", 1, report_layout=True
+    )
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
@@ -331,6 +432,7 @@ def USP(
             cos = sin = None
             if fused_a2a_rotary_emb is not None:
                 cos, sin = fused_a2a_rotary_emb
+            a2a_inputs = (query, key, value)
             query, key, value = fused_a2a_input(
                 query,
                 key,
@@ -342,6 +444,7 @@ def USP(
                 cos,
                 sin,
             )
+            _run_a2a_input_diff(a2a_inputs, (query, key, value))
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
@@ -390,12 +493,14 @@ def USP(
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
         if use_fused_a2a:
+            a2a_output_input = out.contiguous()
             out = fused_a2a_output(
-                out.contiguous(),
+                a2a_output_input,
                 PROCESS_GROUP.ULYSSES_PG,
                 get_ulysses_parallel_rank(),
                 return_sequence_major=fused_a2a_return_sequence_major,
             )
+            _run_a2a_output_diff(a2a_output_input, out)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
