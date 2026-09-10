@@ -8,6 +8,8 @@ import torch.distributed as dist
 
 _FUSED_A2A_MODE = int(os.environ.get("XFUSER_FUSED_A2A", "0"))
 _FUSED_A2A_QUANT = os.environ.get("FUSED_A2A_QUANT", "0") == "1"
+if _FUSED_A2A_QUANT:
+    os.environ["FUSED_A2A_HADAMARD"] = "1"
 if _FUSED_A2A_MODE not in (0, 1, 2):
     raise ValueError("XFUSER_FUSED_A2A must be 0, 1, or 2")
 
