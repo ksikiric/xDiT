@@ -55,9 +55,17 @@ _HEAD_BALANCE_BACKENDS = frozenset({
 _A2A_DIFF_ENABLED = os.environ.get("XFUSER_A2A_DIFF", "0") == "1"
 _A2A_DIFF_INPUT_CALLS = 0
 _A2A_DIFF_OUTPUT_CAPTURED = False
+_A2A_DIFF_EXIT_PENDING = False
 _A2A_DIFF_LATE_CALL = 40
 
 
+def _a2a_diff_number(value):
+    if isinstance(value, str):
+        return value
+    return f"{float(value):.9g}"
+
+
+@torch.compiler.disable
 def _a2a_diff_report(name, fused, reference, rank, hop, call, report_layout):
     fused_f32 = fused.float()
     reference_f32 = reference.float()
@@ -85,8 +93,10 @@ def _a2a_diff_report(name, fused, reference, rank, hop, call, report_layout):
         multiset_match = torch.equal(fused_sorted, reference_sorted)
     prefix = f"[XFUSER_A2A_DIFF rank={rank} hop={hop} call={call}] {name}"
     print(
-        f"{prefix}: max_abs_diff={error.abs().max().item():.9g} "
-        f"sqnr_db={sqnr:.9g} cosine={cosine:.9g} rel_mae={rel_mae:.9g} "
+        f"{prefix}: max_abs_diff={_a2a_diff_number(error.abs().max().item())} "
+        f"sqnr_db={_a2a_diff_number(sqnr)} "
+        f"cosine={_a2a_diff_number(cosine)} "
+        f"rel_mae={_a2a_diff_number(rel_mae)} "
         f"first_mismatch_flat_index={first_mismatch} "
         f"sorted_multiset_match={multiset_match}",
         flush=True,
@@ -114,8 +124,9 @@ def _a2a_diff_report(name, fused, reference, rank, hop, call, report_layout):
         )
 
 
+@torch.compiler.disable
 def _run_a2a_input_diff(inputs, fused_outputs):
-    global _A2A_DIFF_INPUT_CALLS
+    global _A2A_DIFF_INPUT_CALLS, _A2A_DIFF_EXIT_PENDING
     if not _A2A_DIFF_ENABLED:
         return
     _A2A_DIFF_INPUT_CALLS += 1
@@ -127,28 +138,41 @@ def _run_a2a_input_diff(inputs, fused_outputs):
     # Mirror the normal RCCL path byte-for-byte so only the transport changes.
     references = tuple(_ft_c_input_all_to_all(tensor) for tensor in inputs)
     for name, fused, reference in zip(("q", "k", "v"), fused_outputs, references):
+        # Q/K are rotation-dominated here; output-hop SQNR isolates transport. V is unrotated.
         _a2a_diff_report(
             name, fused, reference, rank, "input", call, report_layout=call == 1
         )
     if call == _A2A_DIFF_LATE_CALL:
-        torch.distributed.barrier(group=PROCESS_GROUP.ULYSSES_PG)
-        raise SystemExit(
-            f"XFUSER_A2A_DIFF rank={rank}: input call {call} capture complete"
-        )
+        _A2A_DIFF_EXIT_PENDING = True
 
 
+@torch.compiler.disable
 def _run_a2a_output_diff(output_input, fused_output):
     global _A2A_DIFF_OUTPUT_CAPTURED
-    if not _A2A_DIFF_ENABLED or _A2A_DIFF_OUTPUT_CAPTURED:
+    if not _A2A_DIFF_ENABLED:
         return
-    _A2A_DIFF_OUTPUT_CAPTURED = True
     rank = get_ulysses_parallel_rank()
 
     # Mirror the normal RCCL output path byte-for-byte so only transport changes.
-    reference = _ft_c_output_all_to_all(output_input)
-    _a2a_diff_report(
-        "o", fused_output, reference, rank, "output", 1, report_layout=True
-    )
+    if not _A2A_DIFF_OUTPUT_CAPTURED or _A2A_DIFF_EXIT_PENDING:
+        report_layout = not _A2A_DIFF_OUTPUT_CAPTURED
+        _A2A_DIFF_OUTPUT_CAPTURED = True
+        reference = _ft_c_output_all_to_all(output_input)
+        _a2a_diff_report(
+            "o",
+            fused_output,
+            reference,
+            rank,
+            "output",
+            _A2A_DIFF_INPUT_CALLS,
+            report_layout=report_layout,
+        )
+    if _A2A_DIFF_EXIT_PENDING:
+        torch.distributed.barrier(group=PROCESS_GROUP.ULYSSES_PG)
+        raise SystemExit(
+            f"XFUSER_A2A_DIFF rank={rank}: input call "
+            f"{_A2A_DIFF_INPUT_CALLS} and output capture complete"
+        )
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
