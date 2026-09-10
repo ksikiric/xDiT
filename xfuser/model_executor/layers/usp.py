@@ -125,6 +125,30 @@ def _a2a_diff_report(name, fused, reference, rank, hop, call, report_layout):
 
 
 @torch.compiler.disable
+def _maybe_dump_fused_a2a_qk(q_fused, k_fused, rank, call):
+    if (
+        os.environ.get("FUSED_A2A_DUMP_QK", "0") != "1"
+        or rank != 0
+        or call != 1
+    ):
+        return
+    path = os.environ.get("FUSED_A2A_DUMP_PATH", "/outputs/qk_dump.pt")
+    torch.save(
+        {
+            "q": q_fused.detach().cpu().contiguous(),
+            "k": k_fused.detach().cpu().contiguous(),
+        },
+        path,
+    )
+    print(
+        f"[FUSED_A2A_DUMP_QK rank=0 call=1] wrote {path} "
+        f"q_shape={tuple(q_fused.shape)} q_dtype={q_fused.dtype} "
+        f"k_shape={tuple(k_fused.shape)} k_dtype={k_fused.dtype}",
+        flush=True,
+    )
+
+
+@torch.compiler.disable
 def _run_a2a_input_diff(inputs, fused_outputs):
     global _A2A_DIFF_INPUT_CALLS, _A2A_DIFF_EXIT_PENDING
     if not _A2A_DIFF_ENABLED:
@@ -134,6 +158,9 @@ def _run_a2a_input_diff(inputs, fused_outputs):
     if call not in (1, _A2A_DIFF_LATE_CALL):
         return
     rank = get_ulysses_parallel_rank()
+    if call == 1:
+        q_fused, k_fused, _ = fused_outputs
+        _maybe_dump_fused_a2a_qk(q_fused, k_fused, rank, call)
 
     # Mirror the normal RCCL path byte-for-byte so only the transport changes.
     references = tuple(_ft_c_input_all_to_all(tensor) for tensor in inputs)
