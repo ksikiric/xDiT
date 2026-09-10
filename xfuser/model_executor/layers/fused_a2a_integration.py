@@ -13,6 +13,23 @@ if _FUSED_A2A_QUANT:
 if _FUSED_A2A_MODE not in (0, 1, 2):
     raise ValueError("XFUSER_FUSED_A2A must be 0, 1, or 2")
 
+_FUSED_A2A_CODECS = tuple(
+    os.environ.get(f"FUSED_A2A_CODEC_{role}", os.environ.get("FUSED_A2A_CODEC", "e4m3"))
+    for role in "QKV"
+)
+_FUSED_A2A_PACKED = (
+    _FUSED_A2A_MODE == 1
+    and _FUSED_A2A_QUANT
+    and _FUSED_A2A_CODECS == ("mxfp8", "mxfp8", "e4m3")
+    and os.environ.get("FUSED_A2A_QUANT_RETURN", "fp8") == "fp8"
+)
+if _FUSED_A2A_PACKED:
+    # All three roles must use the consumer ABI, not the default wire layout.
+    for _role in "QKV":
+        os.environ[f"FUSED_A2A_V4_OUTPUT_{_role}"] = "1"
+    os.environ["FUSED_A2A_V4_OUTPUT"] = "1"
+    os.environ["FUSED_A2A_SPLIT"] = "1"
+
 _MORI_GROUP_KEY = None
 _MORI_CPU_GROUP = None
 _OP_CACHE = {}
@@ -21,6 +38,16 @@ _OP_CACHE = {}
 def get_fused_a2a_mode():
     """Return 0 for RCCL, 1 for transport-only, or 2 for full fusion."""
     return _FUSED_A2A_MODE
+
+
+def use_fused_a2a_packed():
+    return _FUSED_A2A_PACKED
+
+
+def fused_a2a_pad_multiple(world_size):
+    if _FUSED_A2A_PACKED or os.environ.get("FUSED_A2A_PAD128", "0") == "1":
+        return world_size * 32
+    return world_size
 
 
 def _group_ranks(group):
@@ -57,7 +84,7 @@ def _init_mori(group, ranks):
     _MORI_GROUP_KEY = group_key
 
 
-def _get_ops(group, rank, shape, dtype, device):
+def _get_ops(group, rank, shape, dtype, device, softmax_scale=None):
     from aiter.ops.flydsl.kernels.fused_a2a_intranode_op import (
         FusedA2AIntraNodeOp,
         FusedA2AOutIntraNodeOp,
@@ -67,7 +94,9 @@ def _get_ops(group, rank, shape, dtype, device):
     group_key = (id(group), ranks)
     device_key = (device.type, device.index)
     b, s_local, h_total, d = shape
-    key = (group_key, rank, device_key, dtype, b, s_local, h_total, d)
+    if softmax_scale is None:
+        softmax_scale = d ** -0.5
+    key = (group_key, rank, device_key, dtype, b, s_local, h_total, d, softmax_scale)
     ops = _OP_CACHE.get(key)
     if ops is None:
         _init_mori(group, ranks)
@@ -78,7 +107,8 @@ def _get_ops(group, rank, shape, dtype, device):
             dtype=dtype,
             fuse_norm_rope=_FUSED_A2A_MODE == 2,
             quant=_FUSED_A2A_QUANT,
-            return_mode="bf16" if _FUSED_A2A_QUANT else None,
+            return_mode="fp8" if _FUSED_A2A_PACKED else "bf16" if _FUSED_A2A_QUANT else None,
+            softmax_scale=softmax_scale if _FUSED_A2A_PACKED else None,
         )
         out_op = FusedA2AOutIntraNodeOp(
             rank=rank,
@@ -101,6 +131,7 @@ def fused_a2a_input(
     norm_k=None,
     cos=None,
     sin=None,
+    softmax_scale=None,
 ):
     """Run the fused in-hop from USP head-major views."""
     sequence_major = tuple(tensor.transpose(1, 2) for tensor in (query, key, value))
@@ -110,10 +141,18 @@ def fused_a2a_input(
         )
 
     q, k, v = sequence_major
-    in_op, _ = _get_ops(group, rank, tuple(q.shape), q.dtype, q.device)
+    in_op, _ = _get_ops(group, rank, tuple(q.shape), q.dtype, q.device, softmax_scale)
     outputs = in_op(q, k, v, norm_q, norm_k, cos, sin)
     b, s_local, h_total, d = q.shape
     world_size = dist.get_world_size(group)
+    if _FUSED_A2A_PACKED:
+        outputs, (q_scales, k_scales, v_scales) = outputs
+        output_shape = (b, world_size * s_local, h_total // world_size, d)
+        scale_shape = (*output_shape[:-1], d // 32)
+        return (
+            tuple(output.view(output_shape) for output in outputs),
+            (q_scales.view(scale_shape), k_scales.view(scale_shape), v_scales),
+        )
     output_shape = (b, h_total // world_size, world_size * s_local, d)
     return tuple(output.view(output_shape) for output in outputs)
 

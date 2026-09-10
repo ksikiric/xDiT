@@ -39,6 +39,7 @@ from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_input,
     fused_a2a_output,
     get_fused_a2a_mode,
+    use_fused_a2a_packed,
 )
 
 # Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
@@ -361,6 +362,36 @@ def _update_and_get_kv_cache(key, value, attn_layer):
     value = value.transpose(1, 2).contiguous()
     return key, value
 
+@torch.compiler.disable
+def _fused_a2a_packed_attn_call(
+    q_packed, k_packed, v_packed, q_scales, k_scales, v_scales, softmax_scale,
+):
+    from xfuser.core.distributed.attention_backend import (
+        _aiter_mha_v4_packed,
+        _aiter_native_fp8_format,
+        _AiterAttentionScaleMode,
+    )
+
+    from aiter import dtypes
+
+    fp8_format = _aiter_native_fp8_format()
+    # Reinterpret transport bytes; do not requantize or rotate them a second time.
+    q_packed, k_packed, v_packed = (
+        tensor.view(dtypes.fp8) for tensor in (q_packed, k_packed, v_packed)
+    )
+    # Transport already folded the V4 multiplier into Q.
+    out = _aiter_mha_v4_packed(
+        q_packed, k_packed, v_packed,
+        q_scales, k_scales, v_scales,
+        fp8_format, fp8_format, fp8_format,
+        _AiterAttentionScaleMode.E8M0_PER_1X32,
+        _AiterAttentionScaleMode.E8M0_PER_1X32,
+        _AiterAttentionScaleMode.F32_PER_TENSOR,
+        softmax_scale=softmax_scale,
+    )
+    return out.transpose(1, 2)
+
+
 def _get_attention_function(backend=None):
     """
     Get the attention function based on the runtime state or from a given explicit backend.
@@ -478,13 +509,21 @@ def USP(
     if fused_a2a_enabled and fused_a2a_mode == 2 and hb_applied:
         raise ValueError("full-fusion A2A is incompatible with USP head balancing")
 
+    packed_a2a = use_fused_a2a and use_fused_a2a_packed()
+    softmax_scale = query.shape[-1] ** -0.5
+    if packed_a2a and (
+        get_ring_parallel_world_size() != 1 or attn_layer is not None
+        or dropout_p != 0.0 or is_causal
+    ):
+        raise NotImplementedError("packed fused A2A requires dense non-causal Ulysses without KV caching")
+
     if get_ulysses_parallel_world_size() > 1:
         if use_fused_a2a:
             cos = sin = None
             if fused_a2a_rotary_emb is not None:
                 cos, sin = fused_a2a_rotary_emb
             a2a_inputs = (query, key, value)
-            query, key, value = fused_a2a_input(
+            a2a_result = fused_a2a_input(
                 query,
                 key,
                 value,
@@ -494,8 +533,13 @@ def USP(
                 fused_a2a_norm_k,
                 cos,
                 sin,
+                softmax_scale=softmax_scale,
             )
-            _run_a2a_input_diff(a2a_inputs, (query, key, value))
+            if packed_a2a:
+                (query, key, value), packed_scales = a2a_result
+            else:
+                query, key, value = a2a_result
+                _run_a2a_input_diff(a2a_inputs, (query, key, value))
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
@@ -526,7 +570,11 @@ def USP(
                         attention_kwargs=attention_kwargs)
 
     else:
-        if get_ring_parallel_world_size() == 1: # Ulysses only
+        if packed_a2a:
+            out = _fused_a2a_packed_attn_call(
+                query, key, value, *packed_scales, softmax_scale,
+            )
+        elif get_ring_parallel_world_size() == 1: # Ulysses only
             out, _ = attention_function(query,
                                         key,
                                         value,

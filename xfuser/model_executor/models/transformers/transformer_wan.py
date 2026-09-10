@@ -11,7 +11,10 @@ from xfuser.model_executor.layers.usp import (
     USP,
     attention,
 )
-from xfuser.model_executor.layers.fused_a2a_integration import get_fused_a2a_mode
+from xfuser.model_executor.layers.fused_a2a_integration import (
+    fused_a2a_pad_multiple,
+    get_fused_a2a_mode,
+)
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
@@ -405,7 +408,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
-        pad_amount = (sp_world_size - (hidden_states.shape[1] % sp_world_size)) % sp_world_size
+        # V4 transport needs each rank's sequence shard divisible by 32.
+        pad_multiple = fused_a2a_pad_multiple(sp_world_size)
+        pad_amount = (pad_multiple - (hidden_states.shape[1] % pad_multiple)) % pad_multiple
         hidden_states = self._chunk_and_pad_sequence(hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1)
 
         if ts_seq_len is not None: # (wan2.2 ti2v)
