@@ -37,6 +37,7 @@ from xfuser.core.sparge_attention.head_balance import (
 )
 from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_input,
+    fused_a2a_input_role,
     fused_a2a_output,
     get_fused_a2a_mode,
     use_fused_a2a_packed,
@@ -434,6 +435,13 @@ def concat_joint_tensors_decorator(func):
         return func(query, key, value, dropout_p=dropout_p, is_causal=is_causal, attention_kwargs=attention_kwargs)
     return wrapper
 
+@torch.compiler.disable
+def usp_fused_a2a_input_role(input, role, pending=None):
+    return fused_a2a_input_role(
+        input, role, PROCESS_GROUP.ULYSSES_PG, get_ulysses_parallel_rank(), pending,
+    )
+
+
 def USP(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -454,6 +462,7 @@ def USP(
         fused_a2a_rotary_emb=None,
         fused_a2a_return_sequence_major=False,
         fused_a2a_enabled=False,
+        fused_a2a_pending=None,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -510,6 +519,8 @@ def USP(
         raise ValueError("full-fusion A2A is incompatible with USP head balancing")
 
     packed_a2a = use_fused_a2a and use_fused_a2a_packed()
+    if fused_a2a_pending is not None and not packed_a2a:
+        raise ValueError("interleaved input requires the packed fused attention consumer")
     softmax_scale = query.shape[-1] ** -0.5
     if packed_a2a and (
         get_ring_parallel_world_size() != 1 or attn_layer is not None
@@ -534,6 +545,7 @@ def USP(
                 cos,
                 sin,
                 softmax_scale=softmax_scale,
+                pending=fused_a2a_pending,
             )
             if packed_a2a:
                 (query, key, value), packed_scales = a2a_result

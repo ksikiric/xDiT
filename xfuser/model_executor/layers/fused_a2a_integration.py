@@ -8,6 +8,7 @@ import torch.distributed as dist
 
 _FUSED_A2A_MODE = int(os.environ.get("XFUSER_FUSED_A2A", "0"))
 _FUSED_A2A_QUANT = os.environ.get("FUSED_A2A_QUANT", "0") == "1"
+_FUSED_A2A_INTERLEAVE = os.environ.get("XFUSER_FUSED_A2A_INTERLEAVE", "0") == "1"
 if _FUSED_A2A_QUANT:
     os.environ["FUSED_A2A_HADAMARD"] = "1"
 if _FUSED_A2A_MODE not in (0, 1, 2):
@@ -42,6 +43,42 @@ def get_fused_a2a_mode():
 
 def use_fused_a2a_packed():
     return _FUSED_A2A_PACKED
+
+
+def use_fused_a2a_interleave():
+    return _FUSED_A2A_INTERLEAVE and _FUSED_A2A_SIDESTREAM and _FUSED_A2A_PACKED
+
+
+@torch.compiler.disable
+def fused_a2a_input_role(input, role, group, rank, pending=None):
+    """Submit one already-normalized sequence-major role without a compute join."""
+    if not use_fused_a2a_interleave():
+        raise RuntimeError("per-role input requires packed sidestream interleave")
+    if role == 0:
+        in_op, _ = _get_ops(group, rank, tuple(input.shape), input.dtype, input.device)
+        side = _input_side_stream(input.device)
+        consumer_done = _INPUT_CONSUMER_DONE.get(input.device)
+        if consumer_done is not None:
+            side.wait_event(consumer_done)
+        pending = {"op": in_op, "side": side, "inputs": [], "next_role": 0}
+    if pending is None or pending["next_role"] != role:
+        raise ValueError("interleave requires Q, K, V in order")
+    side = pending["side"]
+    producer_done = torch.cuda.Event()
+    producer_done.record(torch.cuda.current_stream(input.device))
+    side.wait_event(producer_done)
+    # Raw-pointer launchers do not inform the caching allocator about side reads.
+    input.record_stream(side)
+    pending["inputs"].append(input)
+    pending["outputs"] = pending["op"].submit_role(role, input, stream=side)
+    pending["next_role"] += 1
+    if pending["op"]._epoch <= 1:
+        print(
+            f"[XFUSER_FUSED_A2A_INTERLEAVE rank={rank}] role={'QKV'[role]} "
+            f"epoch={pending['op']._epoch} side={side.cuda_stream}",
+            flush=True,
+        )
+    return pending
 
 
 def fused_a2a_pad_multiple(world_size):
@@ -132,6 +169,7 @@ def fused_a2a_input(
     cos=None,
     sin=None,
     softmax_scale=None,
+    pending=None,
 ):
     """Run the fused in-hop from USP head-major views."""
     sequence_major = tuple(tensor.transpose(1, 2) for tensor in (query, key, value))
@@ -142,7 +180,15 @@ def fused_a2a_input(
 
     q, k, v = sequence_major
     in_op, _ = _get_ops(group, rank, tuple(q.shape), q.dtype, q.device, softmax_scale)
-    outputs = in_op(q, k, v, norm_q, norm_k, cos, sin)
+    if pending is not None:
+        if pending["op"] is not in_op or pending["next_role"] != 3:
+            raise ValueError("interleaved input must finish the same op's Q/K/V trio")
+        transport_done = torch.cuda.Event()
+        transport_done.record(pending["side"])
+        torch.cuda.current_stream(q.device).wait_event(transport_done)
+        outputs = pending["outputs"]
+    else:
+        outputs = in_op(q, k, v, norm_q, norm_k, cos, sin)
     b, s_local, h_total, d = q.shape
     world_size = dist.get_world_size(group)
     if _FUSED_A2A_PACKED:

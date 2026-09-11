@@ -10,10 +10,12 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from xfuser.model_executor.layers.usp import (
     USP,
     attention,
+    usp_fused_a2a_input_role,
 )
 from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_pad_multiple,
     get_fused_a2a_mode,
+    use_fused_a2a_interleave,
 )
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
@@ -104,7 +106,37 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
-        query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        interleave = (
+            use_fused_a2a_interleave()
+            and self.attention_function is USP
+            and not self.is_cross_attention
+            and encoder_hidden_states is None
+            and not attn.fused_projections
+            and rotary_emb is not None
+            and _HAS_FLYDSL
+            and get_ulysses_parallel_world_size() > 1
+            and not get_runtime_state().runtime_config.use_spargeattn_head_balance
+        )
+        fused_a2a_pending = None
+        if interleave:
+            # Preserve mode-1 preprocessing exactly. Reusing the pair helper with
+            # duplicate inputs avoids introducing different norm/RoPE rounding.
+            query = attn.to_q(hidden_states)
+            query, _ = fused_qk_norm_rope(
+                query, query, attn.norm_q, attn.norm_q,
+                rotary_emb[0], rotary_emb[1], attn.heads,
+            )
+            fused_a2a_pending = usp_fused_a2a_input_role(query, 0)
+            key = attn.to_k(hidden_states)
+            key, _ = fused_qk_norm_rope(
+                key, key, attn.norm_k, attn.norm_k,
+                rotary_emb[0], rotary_emb[1], attn.heads,
+            )
+            fused_a2a_pending = usp_fused_a2a_input_role(key, 1, fused_a2a_pending)
+            value = attn.to_v(hidden_states).unflatten(2, (attn.heads, -1))
+            fused_a2a_pending = usp_fused_a2a_input_role(value, 2, fused_a2a_pending)
+        else:
+            query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
         use_fused_a2a_full = (
             get_fused_a2a_mode() == 2
@@ -136,7 +168,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query = query.unflatten(2, (attn.heads, -1))
             key = key.unflatten(2, (attn.heads, -1))
             value = value.unflatten(2, (attn.heads, -1))
-        else:
+        elif not interleave:
             # Collapse norm_q -> norm_k -> apply_rotary_emb(q) -> apply_rotary_emb(k)
             # into a single FlyDSL kernel: inductor cannot fuse RoPE into the norm
             # (the RMS reduction sits between them) and the reference RoPE writes
@@ -185,6 +217,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 fused_a2a_norm_k=attn.norm_k.weight if use_fused_a2a_full else None,
                 fused_a2a_rotary_emb=rotary_emb if use_fused_a2a_full else None,
                 fused_a2a_return_sequence_major=use_fused_a2a_full,
+                fused_a2a_pending=fused_a2a_pending,
             )
         hidden_states = self.attention_function(
             query.transpose(1, 2),
