@@ -37,10 +37,13 @@ from xfuser.core.sparge_attention.head_balance import (
 )
 from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_input,
+    fused_a2a_input_consumer_done,
     fused_a2a_input_role,
     fused_a2a_output,
     get_fused_a2a_mode,
+    use_fused_a2a_interleave,
     use_fused_a2a_packed,
+    use_fused_a2a_packed_f4f4,
 )
 
 # Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
@@ -363,15 +366,38 @@ def _update_and_get_kv_cache(key, value, attn_layer):
     value = value.transpose(1, 2).contiguous()
     return key, value
 
-@torch.compiler.disable
+@torch.library.custom_op(
+    "xfuser::fused_a2a_packed_attention", mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
 def _fused_a2a_packed_attn_call(
-    q_packed, k_packed, v_packed, q_scales, k_scales, v_scales, softmax_scale,
-):
+    q_packed: torch.Tensor, k_packed: torch.Tensor, v_packed: torch.Tensor,
+    q_scales: torch.Tensor, k_scales: torch.Tensor, v_scales: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
     from xfuser.core.distributed.attention_backend import (
         _aiter_mha_v4_packed,
         _aiter_native_fp8_format,
         _AiterAttentionScaleMode,
     )
+
+    if use_fused_a2a_packed_f4f4():
+        from xfuser.core.distributed.attention_backend import _AiterAttentionFormat
+
+        # FP4 stays uint8; transport already folded the V4 multiplier into Q.
+        out = _aiter_mha_v4_packed(
+            q_packed, k_packed, v_packed,
+            q_scales, k_scales, v_scales,
+            _AiterAttentionFormat.MXFP4,
+            _AiterAttentionFormat.MXFP4,
+            _AiterAttentionFormat.MXFP4,
+            _AiterAttentionScaleMode.E8M0_PER_1X32,
+            _AiterAttentionScaleMode.E8M0_PER_1X32,
+            _AiterAttentionScaleMode.E8M0_PER_1X32,
+            softmax_scale=softmax_scale,
+        )
+        fused_a2a_input_consumer_done(q_packed.device)
+        return out.transpose(1, 2)
 
     from aiter import dtypes
 
@@ -390,7 +416,21 @@ def _fused_a2a_packed_attn_call(
         _AiterAttentionScaleMode.F32_PER_TENSOR,
         softmax_scale=softmax_scale,
     )
+    fused_a2a_input_consumer_done(q_packed.device)
     return out.transpose(1, 2)
+
+
+@_fused_a2a_packed_attn_call.register_fake
+def _fused_a2a_packed_attn_fake(q_packed, k_packed, v_packed, q_scales, k_scales, v_scales, softmax_scale):
+    b, s, h, _ = q_packed.shape
+    return q_packed.new_empty((b, s, h, 128), dtype=torch.bfloat16).transpose(1, 2)
+
+
+from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
+from torch.fx.node import has_side_effect
+
+_register_effectful_op(torch.ops.xfuser.fused_a2a_packed_attention.default, _EffectType.ORDERED)
+has_side_effect(torch.ops.xfuser.fused_a2a_packed_attention.default)
 
 
 def _get_attention_function(backend=None):
@@ -435,7 +475,6 @@ def concat_joint_tensors_decorator(func):
         return func(query, key, value, dropout_p=dropout_p, is_causal=is_causal, attention_kwargs=attention_kwargs)
     return wrapper
 
-@torch.compiler.disable
 def usp_fused_a2a_input_role(input, role, pending=None):
     return fused_a2a_input_role(
         input, role, PROCESS_GROUP.ULYSSES_PG, get_ulysses_parallel_rank(), pending,
@@ -519,8 +558,8 @@ def USP(
         raise ValueError("full-fusion A2A is incompatible with USP head balancing")
 
     packed_a2a = use_fused_a2a and use_fused_a2a_packed()
-    if fused_a2a_pending is not None and not packed_a2a:
-        raise ValueError("interleaved input requires the packed fused attention consumer")
+    if fused_a2a_pending is not None and not (use_fused_a2a and use_fused_a2a_interleave()):
+        raise ValueError("interleaved input requires eligible fused transport")
     softmax_scale = query.shape[-1] ** -0.5
     if packed_a2a and (
         get_ring_parallel_world_size() != 1 or attn_layer is not None
@@ -551,7 +590,8 @@ def USP(
                 (query, key, value), packed_scales = a2a_result
             else:
                 query, key, value = a2a_result
-                _run_a2a_input_diff(a2a_inputs, (query, key, value))
+                if _A2A_DIFF_ENABLED and not torch.compiler.is_compiling():
+                    _run_a2a_input_diff(a2a_inputs, (query, key, value))
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
@@ -603,7 +643,9 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        if use_fused_a2a:
+        if fused_a2a_pending is not None and not packed_a2a:
+            fused_a2a_input_consumer_done(query.device)
+        if use_fused_a2a and fused_a2a_mode == 2:
             a2a_output_input = out.contiguous()
             out = fused_a2a_output(
                 a2a_output_input,
@@ -611,7 +653,8 @@ def USP(
                 get_ulysses_parallel_rank(),
                 return_sequence_major=fused_a2a_return_sequence_major,
             )
-            _run_a2a_output_diff(a2a_output_input, out)
+            if _A2A_DIFF_ENABLED and not torch.compiler.is_compiling():
+                _run_a2a_output_diff(a2a_output_input, out)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
