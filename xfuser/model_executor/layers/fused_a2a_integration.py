@@ -12,8 +12,25 @@ _FUSED_A2A_MODE = int(os.environ.get("XFUSER_FUSED_A2A", "0"))
 _FUSED_A2A_QUANT = os.environ.get("FUSED_A2A_QUANT", "0") == "1"
 _FUSED_A2A_SIDESTREAM = os.environ.get("XFUSER_FUSED_A2A_SIDESTREAM", "0") == "1"
 _FUSED_A2A_INTERLEAVE = os.environ.get("XFUSER_FUSED_A2A_INTERLEAVE", "0") == "1"
+_FUSED_A2A_HADAMARD_PLACEMENT = os.environ.get(
+    "XFUSER_FUSED_A2A_HADAMARD_PLACEMENT", "transport"
+).lower()
+if _FUSED_A2A_HADAMARD_PLACEMENT not in (
+    "transport",
+    "preprocess",
+    "epilogue",
+    "none",
+):
+    raise ValueError(
+        "XFUSER_FUSED_A2A_HADAMARD_PLACEMENT must be transport, preprocess, "
+        f"epilogue, or none; got {_FUSED_A2A_HADAMARD_PLACEMENT!r}"
+    )
 if _FUSED_A2A_QUANT:
-    os.environ["FUSED_A2A_HADAMARD"] = "1"
+    # Apply the transform exactly once. The preprocess and epilogue variants
+    # run before transport; AITER must not rotate packed V4 Q/K again.
+    _transport_hadamard = _FUSED_A2A_HADAMARD_PLACEMENT == "transport"
+    os.environ["FUSED_A2A_HADAMARD"] = str(int(_transport_hadamard))
+    os.environ["FUSED_A2A_V4_HADAMARD"] = str(int(_transport_hadamard))
 if _FUSED_A2A_MODE not in (0, 1, 2):
     raise ValueError("XFUSER_FUSED_A2A must be 0, 1, or 2")
 
@@ -34,6 +51,14 @@ _FUSED_A2A_PACKED_F4F4 = (
     and os.environ.get("FUSED_A2A_QUANT_RETURN", "fp8") == "fp8"
 )
 _FUSED_A2A_PACKED = _FUSED_A2A_PACKED_MXFP8 or _FUSED_A2A_PACKED_F4F4
+if (
+    _FUSED_A2A_MODE
+    and _FUSED_A2A_HADAMARD_PLACEMENT in ("preprocess", "epilogue")
+    and not _FUSED_A2A_PACKED_MXFP8
+):
+    raise ValueError(
+        "preprocess/epilogue Hadamard placement requires packed MXFP8 transport"
+    )
 if _FUSED_A2A_PACKED:
     # All three roles must use the consumer ABI, not the default wire layout.
     for _role in "QKV":
@@ -62,12 +87,18 @@ _FUSED_A2A_COLLECTIVE = (
 
 
 def _register_input_collective():
-    expected = ("2.9.1+gitff65f5b", "e63c384da344ad04e68ad01481fbd130adc73bce")
+    supported = {
+        ("2.9.1+gitff65f5b", "e63c384da344ad04e68ad01481fbd130adc73bce"),
+        # amdsiloai/pytorch-xdit:v26.9. The private collective/wait signatures
+        # and Python-wrapper implementations match the reference build.
+        ("2.9.1+gitff65f5b", "bcfe9233b739a9ef700f8deec0a7495ed258fcdc"),
+    }
     actual = (torch.__version__, torch.version.git_version)
-    if actual != expected:
+    if actual not in supported:
         raise RuntimeError(
-            f"xfuser input collective private Inductor shim requires torch {expected}; "
-            f"found {actual}. Disable fused sidestream interleave or use the pinned image."
+            "xfuser input collective private Inductor shim requires one of "
+            f"{sorted(supported)}; found {actual}. Disable fused sidestream "
+            "interleave or use a validated image."
         )
     from torch._inductor import config, ir
     from torch._inductor.lowering import (
@@ -142,6 +173,11 @@ def _register_input_collective():
 
     @register_lowering(wait_op, type_promotion_kind=None)
     def lower_wait(input):
+        if config.cpp_wrapper:
+            raise RuntimeError(
+                "fused A2A Tier-2 wait lowering does not support Inductor's "
+                "C++ wrapper; use the default Python wrapper"
+            )
         ir._WaitKernel.create_wait(wait_op, input)
         return input
 
@@ -160,7 +196,9 @@ def _input_side_stream(device):
         print(
             f"[XFUSER_FUSED_A2A_SIDESTREAM rank={dist.get_rank()}] "
             f"device={device} compute={torch.cuda.current_stream(device).cuda_stream} "
-            f"side={_INPUT_SIDE_STREAMS[device].cuda_stream}",
+            f"side={_INPUT_SIDE_STREAMS[device].cuda_stream} "
+            f"hadamard={_FUSED_A2A_HADAMARD_PLACEMENT} codecs={_FUSED_A2A_CODECS} "
+            f"tier2={_FUSED_A2A_COLLECTIVE}",
             flush=True,
         )
     return _INPUT_SIDE_STREAMS[device]
@@ -189,6 +227,11 @@ has_side_effect(torch.ops.xfuser.fused_a2a_consumer_done.default)
 def get_fused_a2a_mode():
     """Return 0 for RCCL, 1 for transport-only, or 2 for full fusion."""
     return _FUSED_A2A_MODE
+
+
+def get_fused_a2a_hadamard_placement():
+    """Return where Q/K Hadamard is applied for the current process."""
+    return _FUSED_A2A_HADAMARD_PLACEMENT
 
 
 def use_fused_a2a_packed():

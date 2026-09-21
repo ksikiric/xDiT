@@ -14,6 +14,7 @@ from xfuser.model_executor.layers.usp import (
 )
 from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_pad_multiple,
+    get_fused_a2a_hadamard_placement,
     get_fused_a2a_mode,
     use_fused_a2a_interleave,
 )
@@ -31,6 +32,7 @@ from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.vsa_attention import jenga_scheduled_drop_rate
 from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     fused_qk_norm_rope,
+    wan_flydsl_hadamard,
     _HAS_FLYDSL,
 )
 
@@ -117,21 +119,39 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             and get_ulysses_parallel_world_size() > 1
             and not get_runtime_state().runtime_config.use_spargeattn_head_balance
         )
+        hadamard_placement = get_fused_a2a_hadamard_placement()
+        relocate_hadamard = (
+            get_fused_a2a_mode() == 1
+            and hadamard_placement in ("preprocess", "epilogue")
+            and self.attention_function is USP
+            and not self.is_cross_attention
+            and encoder_hidden_states is None
+            and rotary_emb is not None
+            and _HAS_FLYDSL
+            and get_ulysses_parallel_world_size() > 1
+            and not get_runtime_state().runtime_config.use_spargeattn_head_balance
+        )
         fused_a2a_pending = None
         if interleave:
-            # Preserve mode-1 preprocessing exactly. Reusing the pair helper with
-            # duplicate inputs avoids introducing different norm/RoPE rounding.
             query = attn.to_q(hidden_states)
             query, _ = fused_qk_norm_rope(
                 query, query, attn.norm_q, attn.norm_q,
                 rotary_emb[0], rotary_emb[1], attn.heads,
+                single_role=True,
+                apply_hadamard=hadamard_placement == "preprocess",
             )
+            if hadamard_placement == "epilogue":
+                query = wan_flydsl_hadamard(query)
             fused_a2a_pending = usp_fused_a2a_input_role(query, 0)
             key = attn.to_k(hidden_states)
             key, _ = fused_qk_norm_rope(
                 key, key, attn.norm_k, attn.norm_k,
                 rotary_emb[0], rotary_emb[1], attn.heads,
+                single_role=True,
+                apply_hadamard=hadamard_placement == "preprocess",
             )
+            if hadamard_placement == "epilogue":
+                key = wan_flydsl_hadamard(key)
             fused_a2a_pending = usp_fused_a2a_input_role(key, 1, fused_a2a_pending)
             value = attn.to_v(hidden_states).unflatten(2, (attn.heads, -1))
             fused_a2a_pending = usp_fused_a2a_input_role(value, 2, fused_a2a_pending)
@@ -179,8 +199,20 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # value carries no norm/rope -- it just needs the head split.
             if _HAS_FLYDSL and rotary_emb is not None:
                 query, key = fused_qk_norm_rope(
-                    query, key, attn.norm_q, attn.norm_k, rotary_emb[0], rotary_emb[1], attn.heads
+                    query,
+                    key,
+                    attn.norm_q,
+                    attn.norm_k,
+                    rotary_emb[0],
+                    rotary_emb[1],
+                    attn.heads,
+                    apply_hadamard=(
+                        relocate_hadamard and hadamard_placement == "preprocess"
+                    ),
                 )
+                if relocate_hadamard and hadamard_placement == "epilogue":
+                    query = wan_flydsl_hadamard(query)
+                    key = wan_flydsl_hadamard(key)
                 value = value.unflatten(2, (attn.heads, -1))
             else:
                 query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
