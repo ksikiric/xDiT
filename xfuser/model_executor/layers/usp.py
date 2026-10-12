@@ -1,7 +1,8 @@
 # This file implements USP with torch version >= '2.5.0'
 import functools
 import inspect
-from typing import Tuple
+import os
+from typing import NamedTuple, Tuple
 
 import torch
 import torch.distributed._functional_collectives as ft_c
@@ -61,6 +62,7 @@ _FP8_NCCL_NEEDS_VIEW = not version_at_least(torch.__version__, "2.11.0")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 _warned_fp8_comms_missing_attn = False
 logger = init_logger(__name__)
+_QUANTIZED_OUTPUT_HANDOFF = os.environ.get("XFUSER_QUANTIZED_OUTPUT_HANDOFF", "0") == "1"
 _CUSTOM_OP_OPTIONS = (
     {"tags": (torch.Tag.cudagraph_unsafe,)}
     if hasattr(torch, "Tag") and "tags" in inspect.signature(torch.library.custom_op).parameters
@@ -86,6 +88,11 @@ def _warn_fp8_comms_missing_attn():
 # lists their ``attention_kwargs`` keys under this one, and USP carries them
 # through the same Ulysses exchange without knowing what they mean.
 ULYSSES_EXTRA_INPUTS_KEY = "ulysses_extra_inputs"
+
+
+class PrequantizedAttentionOutput(NamedTuple):
+    payload: torch.Tensor
+    scale: torch.Tensor
 
 
 def ring_attn(
@@ -301,6 +308,26 @@ def _ft_c_output_all_to_all(x):
     x = _sdpa_all_to_all_single(x)
     x = x.reshape(world_size, s // world_size, b, -1, d).permute(2, 0, 3, 1, 4).reshape(b, -1, s // world_size, d)
     return x
+
+
+def _quantized_output_all_to_all(out):
+    """Quantize complete head vectors, then redistribute payload and scales."""
+    batch, heads, sequence, head_dim = out.shape
+    contiguous = out.contiguous()
+    payload, scale = torch.ops.xfuser.fp8_per_1x128_quant(contiguous.view(batch * heads * sequence, head_dim))
+    payload = payload.view(batch, heads, sequence, head_dim)
+    scale = scale.view(batch, heads, sequence, -1)
+    return PrequantizedAttentionOutput(
+        _ft_c_output_all_to_all(payload),
+        _ft_c_output_all_to_all(scale),
+    )
+
+
+def _can_handoff_quantized_output(attn_layer, head_balanced):
+    if not _QUANTIZED_OUTPUT_HANDOFF or attn_layer is None or head_balanced:
+        return False
+    to_out = getattr(attn_layer, "to_out", None)
+    return bool(to_out and callable(getattr(to_out[0], "forward_prequantized", None)))
 
 
 def _preprocess_joint_tensors(joint_key, joint_value):
@@ -1108,14 +1135,23 @@ def USP(
                 joint_attn_kwargs=joint_attn_kwargs,
                 attention_kwargs=attention_kwargs,
             )
+        quantized_output_handoff = _can_handoff_quantized_output(
+            attn_layer,
+            hb_applied,
+        )
         if fp8_comms is not None:
             out = fp8_comms_output_all_to_all(out, fp8_comms.o_scale, qkv_amaxes)
+        elif quantized_output_handoff:
+            out = _quantized_output_all_to_all(out)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
             # Restore global head order on the output, gather this step's per-head
             # costs across the Ulysses group, and plan next step's permutation.
             out = revert_head_balance(out, attention_kwargs, head_balance_layer, hb_uly)
+
+    if isinstance(out, PrequantizedAttentionOutput):
+        return out
 
     if fp8_module is not None and not use_attention_a2a and not joint_strategy:
         fp8_observe_output(get_runtime_state().fp8_comms, fp8_module, out, False)

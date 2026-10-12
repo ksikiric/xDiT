@@ -126,7 +126,7 @@ def main(args: Optional[List[str]] = None) -> None:
             sys.exit(f"xdit: {error}")
         torchrun_values["--nproc_per_node"] = str(nproc_per_node)
 
-    runner_module = "xfuser.runner"
+    runner_module = os.environ.get("XDIT_RUNNER_MODULE", "xfuser.runner")
 
     # Build the torchrun command
     cmd = [

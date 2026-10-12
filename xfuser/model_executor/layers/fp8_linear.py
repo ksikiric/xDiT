@@ -16,11 +16,13 @@ def _hip_quant_per_1x128():
     # triton twin get_triton_quant is lru_cached; the hip one is not).
     return aiter.get_hip_quant(aiter.QuantType.per_1x128)
 
+
 try:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale_preshuffle,
     )
+
     _HAS_PRESHUFFLE = True
 except ImportError:
     _HAS_PRESHUFFLE = False  # older AITER without preshuffle blockscale GEMM
@@ -58,7 +60,8 @@ def _pad_cols_to_multiple(t: torch.Tensor, block: int) -> tuple[torch.Tensor, bo
 
 
 def quantize_weight_to_fp8_blockscale_plain(
-    weight: torch.Tensor, device: Optional[torch.device] = None,
+    weight: torch.Tensor,
+    device: Optional[torch.device] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-128 FP8 quantize a weight to the plain (non-preshuffle) layout.
 
@@ -78,12 +81,58 @@ def quantize_weight_to_fp8_blockscale_plain(
         w = torch.nn.functional.pad(w, (0, c_pad, 0, r_pad))
     w_blocks = w.reshape(n_blocks, _FP8_BLOCK, k_blocks, _FP8_BLOCK)
     w_amax = w_blocks.abs().amax(dim=(1, 3)).clamp(min=1e-12)
-    w_scale = (w_amax.float() / _fp8_max())
+    w_scale = w_amax.float() / _fp8_max()
     w_q = _quantize_weight_blocks(w_blocks, w_amax)
     w_q = w_q.reshape(n_blocks * _FP8_BLOCK, k_blocks * _FP8_BLOCK)
     if r_pad or c_pad:
         w_q = w_q[:N, :K].contiguous()
     return w_q, w_scale
+
+
+@torch.library.custom_op("xfuser::fp8_per_1x128_quant", mutates_args=())
+def _fp8_per_1x128_quant(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.ndim != 2 or x.shape[1] % _FP8_BLOCK:
+        raise ValueError("FP8 per-1x128 quantization expects [M, K] with K divisible by 128")
+    return _hip_quant_per_1x128()(x, quant_dtype=_fp8_dtype())
+
+
+@_fp8_per_1x128_quant.register_fake
+def _(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        x.new_empty(x.shape, dtype=_fp8_dtype()),
+        x.new_empty((x.shape[0], x.shape[1] // _FP8_BLOCK), dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op(
+    "xfuser::fp8_blockscale_gemm_prequantized",
+    mutates_args=(),
+)
+def _fp8_blockscale_gemm_prequantized(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    return aiter.gemm_a8w8_blockscale(x_fp8, w_fp8, x_scale, w_scale)
+
+
+@_fp8_blockscale_gemm_prequantized.register_fake
+def _(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    del x_scale, w_scale
+    return torch.empty(
+        x_fp8.shape[0],
+        w_fp8.shape[0],
+        dtype=torch.bfloat16,
+        device=x_fp8.device,
+    )
 
 
 @torch.library.custom_op("xfuser::fp8_blockscale_gemm", mutates_args=())
@@ -141,6 +190,56 @@ def _(
     return torch.empty(x.shape[0], n, dtype=torch.bfloat16, device=x.device)
 
 
+@torch.library.custom_op(
+    "xfuser::fp8_blockscale_gemm_preshuffle_prequantized",
+    mutates_args=(),
+)
+def _fp8_blockscale_gemm_preshuffle_prequantized(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_shuffle: torch.Tensor,
+    w_scale: torch.Tensor,
+    n: int,
+    k_padded: int,
+) -> torch.Tensor:
+    if x_fp8.shape[1] != k_padded:
+        raise ValueError("prequantized preshuffle GEMM currently requires an aligned K")
+    x_scale = (
+        x_scale.transpose(0, 1)
+        .contiguous()
+        .view(
+            x_scale.shape[1],
+            x_scale.shape[0],
+        )
+    )
+    out = gemm_a8w8_blockscale_preshuffle(
+        x_fp8,
+        w_shuffle,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+    )
+    return out[:, :n].contiguous() if out.shape[1] != n else out
+
+
+@_fp8_blockscale_gemm_preshuffle_prequantized.register_fake
+def _(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_shuffle: torch.Tensor,
+    w_scale: torch.Tensor,
+    n: int,
+    k_padded: int,
+) -> torch.Tensor:
+    del x_scale, w_shuffle, w_scale, k_padded
+    return torch.empty(
+        x_fp8.shape[0],
+        n,
+        dtype=torch.bfloat16,
+        device=x_fp8.device,
+    )
+
+
 def _rehome_sentinel(sentinel: torch.Tensor, fn) -> torch.Tensor:
     """Put the `weight` sentinel wherever `fn` puts real tensors, without copying it.
 
@@ -170,8 +269,9 @@ class xFuserFP8BlockScaleLinear(nn.Module):
         x_scale (runtime): [M, K/128]
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 device=None, dtype=None, preshuffle: bool = True):
+    def __init__(
+        self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None, preshuffle: bool = True
+    ):
         super().__init__()
         # Preshuffle needs a newer AITER and can be disabled via env for A/B measurement.
         # Fall back to the plain blockscale path when the kernel is absent or forced off.
@@ -184,14 +284,14 @@ class xFuserFP8BlockScaleLinear(nn.Module):
         self._compute_dtype = dtype or torch.bfloat16
         self.register_parameter("weight", None)
         if bias:
-            self.bias = nn.Parameter(
-                torch.empty(out_features, device=device, dtype=dtype)
-            )
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
         else:
             self.register_parameter("bias", None)
 
     def load_and_quantize_weights(
-        self, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         self._quantize_weights(weight, device=device)
@@ -248,7 +348,7 @@ class xFuserFP8BlockScaleLinear(nn.Module):
 
         w_blocks = w.reshape(n_blocks, _FP8_BLOCK, k_blocks, _FP8_BLOCK)
         w_amax = w_blocks.abs().amax(dim=(1, 3)).clamp(min=1e-12)  # [n_blocks, k_blocks]
-        w_scale = (w_amax.float() / _fp8_max())
+        w_scale = w_amax.float() / _fp8_max()
 
         w_q = _quantize_weight_blocks(w_blocks, w_amax)
         w_q = w_q.reshape(n_blocks * _FP8_BLOCK, k_blocks * _FP8_BLOCK)
@@ -324,12 +424,52 @@ class xFuserFP8BlockScaleLinear(nn.Module):
         if self.preshuffle:
             k_padded = ((self.in_features + _FP8_BLOCK - 1) // _FP8_BLOCK) * _FP8_BLOCK
             output = torch.ops.xfuser.fp8_blockscale_gemm_preshuffle(
-                x, weight_fp8, weight_scale, self.out_features, k_padded,
+                x,
+                weight_fp8,
+                weight_scale,
+                self.out_features,
+                k_padded,
             ).to(input.dtype)
         else:
             output = torch.ops.xfuser.fp8_blockscale_gemm(
-                x, weight_fp8, weight_scale,
+                x,
+                weight_fp8,
+                weight_scale,
             ).to(input.dtype)
+        if self.bias is not None:
+            output = output + self.bias
+        return output.view(*original_shape[:-1], self.out_features)
+
+    def forward_prequantized(
+        self,
+        input_fp8: torch.Tensor,
+        input_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Consume the same per-1x128 activation contract as ordinary forward."""
+        original_shape = input_fp8.shape
+        x_fp8 = input_fp8.reshape(-1, self.in_features)
+        x_scale = input_scale.reshape(
+            x_fp8.shape[0],
+            self.in_features // _FP8_BLOCK,
+        )
+        weight_fp8, weight_scale = self._gemm_operands(x_fp8)
+        if self.preshuffle:
+            output = torch.ops.xfuser.fp8_blockscale_gemm_preshuffle_prequantized(
+                x_fp8,
+                x_scale,
+                weight_fp8,
+                weight_scale,
+                self.out_features,
+                self.in_features,
+            )
+        else:
+            output = torch.ops.xfuser.fp8_blockscale_gemm_prequantized(
+                x_fp8,
+                x_scale,
+                weight_fp8,
+                weight_scale,
+            )
+        output = output.to(self._compute_dtype)
         if self.bias is not None:
             output = output + self.bias
         return output.view(*original_shape[:-1], self.out_features)
@@ -361,7 +501,4 @@ class xFuserFP8BlockScaleLinear(nn.Module):
         return module
 
     def extra_repr(self):
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}"
-        )
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"

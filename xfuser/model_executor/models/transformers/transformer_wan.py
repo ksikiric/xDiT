@@ -7,6 +7,7 @@ from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 from xfuser.model_executor.layers.usp import (
+    PrequantizedAttentionOutput,
     USP,
     attention,
     usp_fused_a2a_input_k,
@@ -236,13 +237,26 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 attention_a2a_pending=attention_a2a_pending,
             )
 
-        hidden_states = self.attention_function(
+        attention_output = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
             **attention_call_kwargs,
-        ).transpose(1, 2)
+        )
+        if isinstance(attention_output, PrequantizedAttentionOutput):
+            if hidden_states_img is not None:
+                raise NotImplementedError("quantized attention-output handoff does not support I2V image context")
+            payload = attention_output.payload.transpose(1, 2).flatten(2, 3)
+            scale = attention_output.scale.transpose(1, 2).flatten(2, 3)
+            hidden_states = attn.to_out[0].forward_prequantized(
+                payload,
+                scale,
+            )
+            hidden_states = hidden_states.to(activation_dtype)
+            hidden_states = attn.to_out[1](hidden_states)
+            return hidden_states
 
+        hidden_states = attention_output.transpose(1, 2)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(activation_dtype)
 
