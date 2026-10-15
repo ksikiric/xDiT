@@ -64,3 +64,10 @@ def test_attention_a2a_is_rejected_for_unvalidated_wan_runners():
             attention_backend="aiter_fp8",
             attention_a2a="auto",
         )
+
+
+def test_wan21_t2v_declares_aiter_int8_transformer_targets():
+    model = _build("Wan2.1-T2V", gemm_quantization="int8")
+    assert model.capabilities.use_int8_gemms is True
+    assert model.capabilities.use_aiter_int8_gemms is True
+    assert model.settings.int8_gemm_module_list == ["transformer.blocks"]
