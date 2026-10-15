@@ -180,6 +180,8 @@ class xFuserWan21I2VModel(xFuserWanModel):
         ring_degree=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_text_encoder=True,
         use_cfg_parallel=True,
         use_fp4_gemms=True,
@@ -212,6 +214,7 @@ class xFuserWan21I2VModel(xFuserWanModel):
         mod_value=16,  # vae_scale_factor_spatial * patch_size[1] = 8
         fps=16,
         fp8_gemm_module_list=["transformer.blocks"],
+        int8_gemm_module_list=["transformer.blocks"],
         fp8_text_encoder_module_list=["text_encoder.encoder.block"],
         fp4_gemm_module_list=["transformer.blocks"],
         fp8_precision_overrides=(
@@ -343,6 +346,7 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
             "dtype": torch.bfloat16,
         }
         self.settings.fp8_gemm_module_list = ["transformer.blocks", "transformer_2.blocks"]
+        self.settings.int8_gemm_module_list = ["transformer.blocks", "transformer_2.blocks"]
         self.settings.fp8_text_encoder_module_list = ["text_encoder.encoder.block"]
         self.settings.fp8_precision_overrides = None
         self.settings.transformer_attr_names = ["transformer", "transformer_2"]
@@ -454,6 +458,8 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         ring_degree=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_text_encoder=True,
         use_cfg_parallel=False,
         use_fp4_gemms=True,
@@ -616,6 +622,8 @@ class xFuserWan21T2VModel(xFuserWanModel):
         ring_degree=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_text_encoder=True,
         use_fp4_gemms=True,
         use_hybrid_attn_schedule=True,
@@ -641,6 +649,8 @@ class xFuserWan21T2VModel(xFuserWanModel):
         ring_degree=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp4_gemms=True,
         use_fp6_gemms=True,
         use_a6w4_gemms=True,
@@ -659,6 +669,7 @@ class xFuserWan21T2VModel(xFuserWanModel):
         model_name="Wan-AI/Wan2.1-T2V-14B-Diffusers",
         output_name="wan2.1_t2v",
         fp8_gemm_module_list=["transformer.blocks"],
+        int8_gemm_module_list=["transformer.blocks"],
         fp8_text_encoder_module_list=["text_encoder.encoder.block"],
         fp4_gemm_module_list=["transformer.blocks"],
         fp8_precision_overrides=(
@@ -793,6 +804,7 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
             "dtype": torch.bfloat16,
         }
         self.settings.fp8_gemm_module_list = ["transformer.blocks", "transformer_2.blocks"]
+        self.settings.int8_gemm_module_list = ["transformer.blocks", "transformer_2.blocks"]
         self.settings.fp8_text_encoder_module_list = ["text_encoder.encoder.block"]
         self.settings.fp8_precision_overrides = None
         self.settings.transformer_attr_names = ["transformer", "transformer_2"]
@@ -892,6 +904,8 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         fully_shard_degree=True,
         use_cfg_parallel=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_text_encoder=True,
         use_fp4_gemms=True,
         use_fp8_comms=True,
@@ -932,6 +946,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         model_name="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         output_name="wan2.2_ti2v",
         fp8_gemm_module_list=["transformer.blocks"],
+        int8_gemm_module_list=["transformer.blocks"],
         fp8_text_encoder_module_list=["text_encoder.encoder.block"],
         fp4_gemm_module_list=["transformer.blocks"],
         fp8_precision_overrides=("0.", "1.", "28.", "29."),
@@ -1053,6 +1068,8 @@ class xFuserWan21VACEModel(xFuserWanModel):
         ulysses_degree=True,
         ring_degree=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_text_encoder=True,
         cross_attention_backend=True,
         enable_tiling=True,
@@ -1076,6 +1093,7 @@ class xFuserWan21VACEModel(xFuserWanModel):
         fps=16,
         model_output_type="video",
         fp8_gemm_module_list=["transformer.blocks", "transformer.vace_blocks"],
+        int8_gemm_module_list=["transformer.blocks", "transformer.vace_blocks"],
         fp8_text_encoder_module_list=["text_encoder.encoder.block"],
         fsdp_strategy={
             "transformer": {

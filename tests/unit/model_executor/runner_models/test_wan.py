@@ -44,3 +44,10 @@ def test_wan21_t2v_1_3b_rejects_ulysses_degree_that_splits_a_head():
 
 def test_wan21_t2v_14b_keeps_accepting_ulysses_degree_8():
     _build("Wan2.1-T2V", ulysses_degree=8)
+
+
+def test_wan21_t2v_declares_aiter_int8_transformer_targets():
+    model = _build("Wan2.1-T2V", gemm_quantization="int8")
+    assert model.capabilities.use_int8_gemms is True
+    assert model.capabilities.use_aiter_int8_gemms is True
+    assert model.settings.int8_gemm_module_list == ["transformer.blocks"]
