@@ -278,6 +278,7 @@ def _probe_aiter_int8_apis(
     try:
         import_module("aiter")
         kernel = import_module("aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave")
+        quant = import_module("aiter.ops.quant")
         shim = import_module("aiter.ops.flydsl.kernels.tensor_shim")
         shuffle = import_module("aiter.ops.shuffle")
     except Exception as exc:
@@ -287,6 +288,10 @@ def _probe_aiter_int8_apis(
         )
     required = (
         ("compile_int8_gemm_4w", getattr(kernel, "compile_int8_gemm_4w", None)),
+        (
+            "per_token_quant_i8_rne_hip",
+            getattr(quant, "per_token_quant_i8_rne_hip", None),
+        ),
         ("_run_compiled", getattr(shim, "_run_compiled", None)),
         ("shuffle_weight", getattr(shuffle, "shuffle_weight", None)),
     )
