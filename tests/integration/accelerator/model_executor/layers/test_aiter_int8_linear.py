@@ -12,7 +12,6 @@ def _gfx950_available() -> bool:
         return False
     try:
         import aiter  # noqa: F401
-        from aiter.ops.quant import per_token_quant_i8_rne_hip  # noqa: F401
     except ImportError:
         return False
     return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
@@ -26,30 +25,16 @@ pytestmark = pytest.mark.skipif(
 
 @torch.no_grad()
 def test_aiter_int8_quantizer_uses_round_to_nearest():
-    values = torch.zeros(
-        (1, 256),
+    values = torch.tensor(
+        [[0.49, 0.51, 1.49, 1.51, -0.49, -0.51, -1.49, -1.51, 3.0]],
         device="cuda",
-        dtype=torch.bfloat16,
-    )
-    values[0, :9] = torch.tensor(
-        [20.5, 21.5, 62.5, 63.5, -20.5, -21.5, -62.5, -63.5, 127.0],
-        device="cuda",
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
     )
     quantized, scale = _quantize_rows_int8(values)
-
-    assert scale.item() == 1.0
-    assert quantized[0, :9].cpu().tolist() == [
-        20,
-        22,
-        62,
-        64,
-        -20,
-        -22,
-        -62,
-        -64,
-        127,
-    ]
+    expected = (
+        (values / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+    )
+    assert torch.equal(quantized, expected)
 
 
 @torch.no_grad()

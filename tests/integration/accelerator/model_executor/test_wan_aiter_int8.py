@@ -18,7 +18,6 @@ def _aiter_int8_available() -> bool:
         from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import (
             compile_int8_gemm_4w,  # noqa: F401
         )
-        from aiter.ops.quant import per_token_quant_i8_rne_hip  # noqa: F401
     except ImportError:
         return False
     return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
