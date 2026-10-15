@@ -5,6 +5,9 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
 
 _BLOCK_M = 256
 _BLOCK_N = 256
@@ -41,9 +44,39 @@ def select_aiter_int8_variant(
     return AiterInt8Variant("default", persistent=False)
 
 
-def _quantize_rows_int8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.quant.quant import dynamic_per_token_quant_fp8_i8
+@triton.jit
+def _quantize_rows_int8_kernel(
+    output,
+    scale_output,
+    source,
+    columns: tl.constexpr,
+    source_stride,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    column = tl.arange(0, BLOCK)
+    mask = column < columns
+    values = tl.load(
+        source + row * source_stride + column,
+        mask=mask,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    amax = tl.max(tl.abs(values), axis=0)
+    scale = amax / 127.0
+    reciprocal = tl.where(amax > 0.0, 1.0 / scale, 0.0)
+    quantized = libdevice.rint(values * reciprocal)
+    quantized = tl.maximum(tl.minimum(quantized, 127.0), -127.0)
+    tl.store(scale_output + row, scale)
+    tl.store(
+        output + row * columns + column,
+        quantized.to(tl.int8),
+        mask=mask,
+        cache_modifier=".cs",
+    )
 
+
+def _quantize_rows_int8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     tensor = tensor.contiguous()
     quantized = torch.empty_like(tensor, dtype=torch.int8)
     scale = torch.empty(
@@ -51,7 +84,14 @@ def _quantize_rows_int8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
         dtype=torch.float32,
         device=tensor.device,
     )
-    dynamic_per_token_quant_fp8_i8(quantized, tensor, scale)
+    _quantize_rows_int8_kernel[(tensor.shape[0],)](
+        quantized,
+        scale,
+        tensor,
+        tensor.shape[1],
+        tensor.stride(0),
+        BLOCK=triton.next_power_of_2(tensor.shape[1]),
+    )
     return quantized, scale
 
 

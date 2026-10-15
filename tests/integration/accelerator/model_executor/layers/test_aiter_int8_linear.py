@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from xfuser.model_executor.layers.aiter_int8_linear import (
+    _quantize_rows_int8,
     xFuserAiterInt8Linear,
 )
 
@@ -20,6 +21,20 @@ pytestmark = pytest.mark.skipif(
     not _gfx950_available(),
     reason="AITER true-INT8 linear requires ROCm gfx950",
 )
+
+
+@torch.no_grad()
+def test_aiter_int8_quantizer_uses_round_to_nearest():
+    values = torch.tensor(
+        [[0.49, 0.51, 1.49, 1.51, -0.49, -0.51, -1.49, -1.51, 3.0]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    quantized, scale = _quantize_rows_int8(values)
+    expected = (
+        (values / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+    )
+    assert torch.equal(quantized, expected)
 
 
 @torch.no_grad()
