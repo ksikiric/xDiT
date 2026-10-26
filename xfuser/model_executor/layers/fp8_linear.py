@@ -269,6 +269,8 @@ class xFuserFP8BlockScaleLinear(nn.Module):
         x_scale (runtime): [M, K/128]
     """
 
+    prequantized_input_codec = "e4m3"
+
     def __init__(
         self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None, preshuffle: bool = True
     ):
@@ -444,9 +446,10 @@ class xFuserFP8BlockScaleLinear(nn.Module):
         self,
         input_fp8: torch.Tensor,
         input_scale: torch.Tensor,
+        logical_shape=None,
     ) -> torch.Tensor:
         """Consume the same per-1x128 activation contract as ordinary forward."""
-        original_shape = input_fp8.shape
+        original_shape = input_fp8.shape if logical_shape is None else tuple(logical_shape)
         x_fp8 = input_fp8.reshape(-1, self.in_features)
         x_scale = input_scale.reshape(
             x_fp8.shape[0],

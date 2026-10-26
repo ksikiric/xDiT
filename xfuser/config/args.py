@@ -13,6 +13,7 @@ from xfuser.logger import init_logger
 from xfuser.core.distributed import init_distributed_environment
 from xfuser.config.attention_a2a import (
     ATTENTION_A2A_HADAMARD_PLACEMENTS,
+    ATTENTION_A2A_OUTPUT_HOPS,
     ATTENTION_A2A_PROFILES,
     AttentionA2AConfig,
 )
@@ -184,6 +185,16 @@ def _add_attention_a2a_args(parser) -> None:
             "default (none for INT8, preprocess for the MX/FP8 profiles)."
         ),
     )
+    parser.add_argument(
+        "--attention_a2a_output",
+        choices=ATTENTION_A2A_OUTPUT_HOPS,
+        default="none",
+        help=(
+            "Attention output-hop transport. 'mori' dynamically quantizes "
+            "MHA output to the following FP8 GEMM contract and performs the "
+            "inverse Ulysses A2A through MoRI."
+        ),
+    )
 
 
 @dataclass
@@ -279,6 +290,7 @@ class xFuserArgs:
     fp8_comms_safety_factor: float = DEFAULT_FP8_COMMS_SAFETY_FACTOR
     attention_a2a: str = "none"
     attention_a2a_hadamard: str = "auto"
+    attention_a2a_output: str = "none"
     gemm_high_precision_targets: str = "model"
     gemm_high_precision_module_patterns: Optional[str] = None
     gemm_high_precision_prefix_patterns: Optional[str] = None
@@ -379,9 +391,11 @@ class xFuserArgs:
         config = AttentionA2AConfig(
             profile=self.attention_a2a,
             hadamard=self.attention_a2a_hadamard,
+            output=self.attention_a2a_output,
         )
         self.attention_a2a = config.profile
         self.attention_a2a_hadamard = config.hadamard
+        self.attention_a2a_output = config.output
         if not config.enabled:
             return
         if self.use_hybrid_attn_schedule:
@@ -1608,6 +1622,7 @@ class xFuserArgs:
             attention_a2a=AttentionA2AConfig(
                 profile=self.attention_a2a,
                 hadamard=self.attention_a2a_hadamard,
+                output=self.attention_a2a_output,
             ),
         )
 

@@ -47,6 +47,7 @@ _FUSED_A2A_V_PACK = "default"
 _MORI_GROUP_KEY = None
 _MORI_CPU_GROUP = None
 _OP_CACHE = {}
+_OUTPUT_OP_CACHE = {}
 _INPUT_SIDE_STREAMS = {}
 _INPUT_PENDING = {}
 _INPUT_COLLECTIVE_WAITS = {}
@@ -191,8 +192,8 @@ def _register_input_collective():
     lib = torch.library.Library("xfuser", "FRAGMENT")
     lib.define(
         "fused_a2a_input_collective(Tensor input, Tensor lifetime, "
-        "Tensor[] previous, int role, str profile, str group_name, "
-        "int rank, int world_size, int? valid_kv_len) -> Tensor[]",
+        "Tensor[] previous, int role, str profile, int rank, "
+        "int world_size, int? valid_kv_len, str group_name) -> Tensor[]",
         tags=(torch.Tag.cudagraph_unsafe,),
     )
     lib.define(
@@ -200,7 +201,7 @@ def _register_input_collective():
         tags=(torch.Tag.cudagraph_unsafe,),
     )
 
-    def submit(input, lifetime, previous, role, profile, group_name, rank, world_size, valid_kv_len):
+    def submit(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name):
         del lifetime, previous, world_size
         _require_active_profile(profile)
         group = dist.distributed_c10d._resolve_process_group(group_name)
@@ -226,7 +227,7 @@ def _register_input_collective():
             _INPUT_COLLECTIVE_WAITS[tensor.data_ptr()] = (done, handle, role)
         return [payload, scale]
 
-    def submit_fake(input, lifetime, previous, role, profile, group_name, rank, world_size, valid_kv_len):
+    def submit_fake(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name):
         del lifetime, previous, group_name, rank
         head_major = input.transpose(1, 2)
         payloads, scales = _fake_packed_raw_outputs(
@@ -255,7 +256,7 @@ def _register_input_collective():
         has_side_effect(op)
 
     @register_lowering(submit_op, type_promotion_kind=None)
-    def lower_submit(input, lifetime, previous, role, profile, group_name, rank, world_size, valid_kv_len):
+    def lower_submit(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name):
         outputs = ir._CollectiveKernel.create_out_of_place(
             submit_op,
             input,
@@ -263,10 +264,10 @@ def _register_input_collective():
             previous,
             role,
             profile,
-            group_name,
             rank,
             world_size,
             valid_kv_len,
+            group_name,
         )
         return [ir.TensorBox.create(output) for output in outputs]
 
@@ -302,6 +303,20 @@ def preflight_attention_a2a(config: AttentionA2AConfig) -> None:
             AttentionA2AIntraNodeOp,
             PackedRoleResult,
         )
+
+        if config.output == "mori":
+            from aiter.ops.flydsl.attention_output_a2a_intranode import (
+                AttentionOutputA2AIntraNodeOp,
+                PackedAttentionOutputResult,
+            )
+
+            if getattr(PackedAttentionOutputResult, "_fields", ()) != (
+                "payload",
+                "scale",
+            ):
+                raise RuntimeError("installed AITER has an incompatible packed output A2A contract")
+            if "group" not in inspect.signature(AttentionOutputA2AIntraNodeOp.__init__).parameters:
+                raise RuntimeError("installed AITER lacks output A2A configuration agreement")
 
         _prepare_attention_a2a_packed_launcher()
         if getattr(PackedRoleResult, "_fields", ()) != ("payload", "scale"):
@@ -359,7 +374,7 @@ def configure_attention_a2a(
     if not isinstance(config, AttentionA2AConfig):
         raise TypeError("Attention A2A configuration must be AttentionA2AConfig")
     if config != _ATTENTION_A2A_POLICY and (
-        _OP_CACHE or _INPUT_SIDE_STREAMS or _INPUT_PENDING or _MORI_GROUP_KEY is not None
+        _OP_CACHE or _OUTPUT_OP_CACHE or _INPUT_SIDE_STREAMS or _INPUT_PENDING or _MORI_GROUP_KEY is not None
     ):
         raise RuntimeError("Attention A2A policy cannot change after its runtime state is created")
     if not config.enabled:
@@ -428,7 +443,9 @@ def shutdown_attention_a2a() -> None:
 
     finalize_error = None
     try:
-        if torch.cuda.is_available() and (_OP_CACHE or _INPUT_SIDE_STREAMS or _MORI_GROUP_KEY is not None):
+        if torch.cuda.is_available() and (
+            _OP_CACHE or _OUTPUT_OP_CACHE or _INPUT_SIDE_STREAMS or _MORI_GROUP_KEY is not None
+        ):
             torch.cuda.synchronize()
         if _MORI_GROUP_KEY is not None:
             import mori.shmem as ms
@@ -441,6 +458,7 @@ def shutdown_attention_a2a() -> None:
         _INPUT_COLLECTIVE_WAITS.clear()
         _INPUT_SIDE_STREAMS.clear()
         _OP_CACHE.clear()
+        _OUTPUT_OP_CACHE.clear()
         if _MORI_CPU_GROUP is not None and dist.is_initialized():
             try:
                 dist.destroy_process_group(_MORI_CPU_GROUP)
@@ -501,10 +519,11 @@ def _activate_attention_a2a_config(config: AttentionA2AConfig) -> None:
     _FUSED_A2A_COLLECTIVE = desired_collective
     if config.enabled and dist.is_initialized() and dist.get_rank() == 0:
         logger.info(
-            "[ATTENTION_A2A_PROFILE] %s->%s hadamard=%s path=%s",
+            "[ATTENTION_A2A_PROFILE] %s->%s hadamard=%s output=%s path=%s",
             previous.profile,
             config.profile,
             effective_hadamard,
+            config.output,
             "tier2" if desired_collective else "tier1",
         )
 
@@ -543,6 +562,10 @@ def use_fused_a2a_packed():
 
 def use_fused_a2a_collective():
     return _FUSED_A2A_COLLECTIVE
+
+
+def use_fused_a2a_output_mori():
+    return _ATTENTION_A2A_ENABLED and _ATTENTION_A2A_CONFIG.output == "mori"
 
 
 def get_attention_a2a_execution_path():
@@ -651,10 +674,10 @@ def fused_a2a_input_role(
             previous,
             role,
             _ATTENTION_A2A_CONFIG.profile,
-            group.group_name,
             rank,
             world_size,
             valid_kv_len,
+            group.group_name,
         )
         return (*previous, *outputs)
     handle = (group.group_name, rank, input.device.index)
@@ -873,6 +896,34 @@ def _get_ops(
             valid_kv_len=valid_kv_len,
         )
         _OP_CACHE[key] = op
+    return op
+
+
+def _get_output_op(group, rank, shape, dtype, device, codec):
+    from aiter.ops.flydsl.attention_output_a2a_intranode import (
+        AttentionOutputA2AIntraNodeOp,
+    )
+
+    ranks = _group_ranks(group)
+    group_key = (id(group), ranks)
+    device_key = (device.type, device.index)
+    key = (group_key, rank, device_key, dtype, tuple(shape), codec)
+    op = _OUTPUT_OP_CACHE.get(key)
+    if op is None:
+        if len(_OUTPUT_OP_CACHE) >= _MAX_OP_CACHE_ENTRIES:
+            raise RuntimeError(
+                "Attention output A2A symmetric-buffer cache limit reached; "
+                "shutdown and reinitialize before using another shape"
+            )
+        _init_mori(group, ranks)
+        op = AttentionOutputA2AIntraNodeOp(
+            rank=rank,
+            world_size=len(ranks),
+            shape=shape,
+            group=_MORI_CPU_GROUP,
+            codec=codec,
+        )
+        _OUTPUT_OP_CACHE[key] = op
     return op
 
 
@@ -1286,3 +1337,80 @@ _register_ordered_effect(torch.ops.xfuser.fused_a2a_wait.default)
 
 # Cached outputs are persistent symmetric buffers. A same-key launch is safe only
 # after the prior attention consumer has finished reading them on its stream.
+
+
+def fused_a2a_output_quantized(output_bshd, group, rank, codec):
+    """Quantize and inverse-A2A contiguous MHA output into GEMM-ready BSHD."""
+    return torch.ops.xfuser.fused_a2a_output_quantized.default(
+        output_bshd,
+        codec,
+        rank,
+        dist.get_world_size(group),
+        group.group_name,
+    )
+
+
+@torch.library.custom_op(
+    "xfuser::fused_a2a_output_quantized",
+    mutates_args=(),
+    **_CUSTOM_OP_OPTIONS,
+)
+def _fused_a2a_output_quantized(
+    output_bshd: torch.Tensor,
+    codec: str,
+    rank: int,
+    world_size: int,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    group = dist.distributed_c10d._resolve_process_group(group_name)
+    if dist.get_world_size(group) != world_size:
+        raise ValueError("output A2A world size changed after tracing")
+    op = _get_output_op(
+        group,
+        rank,
+        tuple(output_bshd.shape),
+        output_bshd.dtype,
+        output_bshd.device,
+        codec,
+    )
+    result = op(output_bshd)
+    return result.payload, result.scale
+
+
+@_fused_a2a_output_quantized.register_fake
+def _fused_a2a_output_quantized_fake(
+    output_bshd,
+    codec,
+    rank,
+    world_size,
+    group_name,
+):
+    del group_name, rank
+    b, sequence, heads_local, d = output_bshd.shape
+    if sequence % world_size:
+        raise ValueError("output A2A sequence must divide by world size")
+    shape = (b, sequence // world_size, heads_local * world_size, d)
+    if codec == "mxfp4":
+        rows = b * shape[1]
+        features = shape[2] * d
+        padded_rows = (rows + 255) // 256 * 256
+        padded_scale_columns = (features // 32 + 7) // 8 * 8
+        return (
+            output_bshd.new_empty((rows, features // 2), dtype=torch.uint8),
+            output_bshd.new_empty((padded_rows, padded_scale_columns), dtype=torch.uint8),
+        )
+    if codec == "mxfp6":
+        from aiter.ops.gemm_op_a6w6 import mxfp6_gemm_pack_size
+
+        payload_size, scale_size = mxfp6_gemm_pack_size(b * shape[1], shape[2] * d)
+        return (
+            output_bshd.new_empty((payload_size,), dtype=torch.uint8),
+            output_bshd.new_empty((scale_size,), dtype=torch.uint8),
+        )
+    return (
+        output_bshd.new_empty(shape, dtype=torch.uint8),
+        output_bshd.new_empty(shape[:-1], dtype=torch.float32),
+    )
+
+
+_register_ordered_effect(torch.ops.xfuser.fused_a2a_output_quantized.default)

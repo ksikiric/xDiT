@@ -44,11 +44,13 @@ from xfuser.core.sparge_attention.head_balance import (
 from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_input,
     fused_a2a_input_role,
+    fused_a2a_output_quantized,
     get_fused_a2a_codecs,
     get_fused_a2a_mode,
     get_fused_a2a_profile,
     launch_attention_a2a_packed,
     use_fused_a2a_interleave,
+    use_fused_a2a_output_mori,
     use_fused_a2a_packed,
 )
 
@@ -93,6 +95,17 @@ ULYSSES_EXTRA_INPUTS_KEY = "ulysses_extra_inputs"
 class PrequantizedAttentionOutput(NamedTuple):
     payload: torch.Tensor
     scale: torch.Tensor
+
+
+class TensorwisePrequantizedAttentionOutput(NamedTuple):
+    payload: torch.Tensor
+    scale: torch.Tensor
+
+
+class SequenceMajorPrequantizedAttentionOutput(NamedTuple):
+    payload: torch.Tensor
+    scale: torch.Tensor
+    codec: str
 
 
 def ring_attn(
@@ -323,11 +336,66 @@ def _quantized_output_all_to_all(out):
     )
 
 
-def _can_handoff_quantized_output(attn_layer, head_balanced):
+def _tensorwise_quantized_output_all_to_all(out):
+    """Match TorchAO's destination-local per-tensor dynamic FP8 contract."""
+    batch, heads, sequence, head_dim = out.shape
+    world_size = get_ulysses_parallel_world_size()
+    sequence_local = sequence // world_size
+    by_destination = out.view(
+        batch,
+        heads,
+        world_size,
+        sequence_local,
+        head_dim,
+    )
+    destination_amax = by_destination.abs().amax(dim=(0, 1, 3, 4)).float()
+    destination_amax = _maybe_wait(
+        ft_c.all_reduce(
+            destination_amax,
+            "max",
+            PROCESS_GROUP.ULYSSES_PG,
+        )
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    destination_scale = destination_amax.clamp(min=1e-12) / fp8_max
+    payload = (
+        (by_destination.float() / destination_scale.view(1, 1, world_size, 1, 1))
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+        .view(batch, heads, sequence, head_dim)
+    )
+    return TensorwisePrequantizedAttentionOutput(
+        _ft_c_output_all_to_all(payload),
+        destination_scale[get_ulysses_parallel_rank()].view(1, 1),
+    )
+
+
+def _quantized_output_handoff_kind(attn_layer, head_balanced):
     if not _QUANTIZED_OUTPUT_HANDOFF or attn_layer is None or head_balanced:
-        return False
+        return "none"
     to_out = getattr(attn_layer, "to_out", None)
-    return bool(to_out and callable(getattr(to_out[0], "forward_prequantized", None)))
+    if not to_out:
+        return "none"
+    linear = to_out[0]
+    if callable(getattr(linear, "forward_prequantized", None)):
+        return "block_128"
+    weight = getattr(linear, "weight", None)
+    if type(weight).__name__ == "Float8Tensor" and getattr(weight, "block_size", None) == list(weight.shape):
+        return "tensorwise"
+    return "none"
+
+
+def _prequantized_output_codec(attn_layer):
+    if attn_layer is None:
+        return None
+    to_out = getattr(attn_layer, "to_out", None)
+    if not to_out:
+        return None
+    linear = to_out[0]
+    if not callable(getattr(linear, "forward_prequantized", None)):
+        return None
+    codec = getattr(linear, "prequantized_input_codec", None)
+    return codec if codec in {"e4m3", "mxfp4", "mxfp6"} else None
 
 
 def _preprocess_joint_tensors(joint_key, joint_value):
@@ -694,6 +762,7 @@ def _attention_a2a_packed_attn_call(
     v_scales: torch.Tensor,
     profile: str,
     softmax_scale: float,
+    output_codec: str | None,
 ) -> torch.Tensor:
     out = launch_attention_a2a_packed(
         q_packed,
@@ -705,6 +774,25 @@ def _attention_a2a_packed_attn_call(
         profile,
         softmax_scale,
     )
+    if use_fused_a2a_output_mori() and output_codec is not None:
+        import aiter
+
+        payload, scale = fused_a2a_output_quantized(
+            out,
+            PROCESS_GROUP.ULYSSES_PG,
+            get_ulysses_parallel_rank(),
+            output_codec,
+        )
+        if output_codec == "e4m3":
+            payload = payload.view(aiter.dtypes.fp8)
+        elif output_codec == "mxfp4":
+            payload = payload.view(aiter.dtypes.fp4x2)
+            scale = scale.view(aiter.dtypes.fp8_e8m0)
+        return SequenceMajorPrequantizedAttentionOutput(
+            payload,
+            scale,
+            output_codec,
+        )
     return out.transpose(1, 2)
 
 
@@ -1113,6 +1201,7 @@ def USP(
                 *packed_scales,
                 attention_a2a_profile,
                 query.shape[-1] ** -0.5,
+                _prequantized_output_codec(attn_layer),
             )
         elif ring_world_size == 1:  # Ulysses only
             out, _ = attention_function(
@@ -1135,14 +1224,18 @@ def USP(
                 joint_attn_kwargs=joint_attn_kwargs,
                 attention_kwargs=attention_kwargs,
             )
-        quantized_output_handoff = _can_handoff_quantized_output(
+        quantized_output_handoff = _quantized_output_handoff_kind(
             attn_layer,
             hb_applied,
         )
-        if fp8_comms is not None:
+        if isinstance(out, SequenceMajorPrequantizedAttentionOutput):
+            pass
+        elif fp8_comms is not None:
             out = fp8_comms_output_all_to_all(out, fp8_comms.o_scale, qkv_amaxes)
-        elif quantized_output_handoff:
+        elif quantized_output_handoff == "block_128":
             out = _quantized_output_all_to_all(out)
+        elif quantized_output_handoff == "tensorwise":
+            out = _tensorwise_quantized_output_all_to_all(out)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
@@ -1150,7 +1243,14 @@ def USP(
             # costs across the Ulysses group, and plan next step's permutation.
             out = revert_head_balance(out, attention_kwargs, head_balance_layer, hb_uly)
 
-    if isinstance(out, PrequantizedAttentionOutput):
+    if isinstance(
+        out,
+        (
+            PrequantizedAttentionOutput,
+            TensorwisePrequantizedAttentionOutput,
+            SequenceMajorPrequantizedAttentionOutput,
+        ),
+    ):
         return out
 
     if fp8_module is not None and not use_attention_a2a and not joint_strategy:

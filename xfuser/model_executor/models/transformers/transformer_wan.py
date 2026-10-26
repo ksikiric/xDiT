@@ -8,6 +8,8 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 from xfuser.model_executor.layers.usp import (
     PrequantizedAttentionOutput,
+    SequenceMajorPrequantizedAttentionOutput,
+    TensorwisePrequantizedAttentionOutput,
     USP,
     attention,
     usp_fused_a2a_input_k,
@@ -40,6 +42,45 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+
+
+def _torchao_tensorwise_linear(
+    linear,
+    payload,
+    scale,
+    activation_dtype,
+):
+    from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+        Float8Tensor,
+    )
+
+    batch, sequence, features = payload.shape
+    payload = payload.reshape(batch * sequence, features)
+    weight = linear.weight
+    activation = Float8Tensor(
+        payload,
+        scale,
+        block_size=list(payload.shape),
+        mm_config=weight.mm_config,
+        act_quant_kwargs=None,
+        kernel_preference=weight.kernel_preference,
+        dtype=activation_dtype,
+    )
+    prequantized_weight = Float8Tensor(
+        weight.qdata,
+        weight.scale,
+        block_size=weight.block_size,
+        mm_config=weight.mm_config,
+        act_quant_kwargs=None,
+        kernel_preference=weight.kernel_preference,
+        dtype=weight.dtype,
+    )
+    output = torch.nn.functional.linear(
+        activation,
+        prequantized_weight,
+        linear.bias,
+    )
+    return output.view(batch, sequence, linear.out_features)
 
 
 @xFuserAttentionProcessorRegister.register(WanAttnProcessor)
@@ -243,6 +284,25 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             value.transpose(1, 2),
             **attention_call_kwargs,
         )
+        if isinstance(attention_output, SequenceMajorPrequantizedAttentionOutput):
+            if hidden_states_img is not None:
+                raise NotImplementedError("quantized attention-output handoff does not support I2V image context")
+            if not callable(getattr(attn.to_out[0], "forward_prequantized", None)):
+                raise RuntimeError(
+                    "--attention_a2a_output mori requires a to_out projection with forward_prequantized support"
+                )
+            payload = (
+                attention_output.payload.flatten(2, 3) if attention_output.codec == "e4m3" else attention_output.payload
+            )
+            hidden_states = attn.to_out[0].forward_prequantized(
+                payload,
+                attention_output.scale,
+                tuple(hidden_states.shape),
+            )
+            hidden_states = hidden_states.to(activation_dtype)
+            hidden_states = attn.to_out[1](hidden_states)
+            return hidden_states
+
         if isinstance(attention_output, PrequantizedAttentionOutput):
             if hidden_states_img is not None:
                 raise NotImplementedError("quantized attention-output handoff does not support I2V image context")
@@ -251,6 +311,23 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states = attn.to_out[0].forward_prequantized(
                 payload,
                 scale,
+            )
+            hidden_states = hidden_states.to(activation_dtype)
+            hidden_states = attn.to_out[1](hidden_states)
+            return hidden_states
+
+        if isinstance(
+            attention_output,
+            TensorwisePrequantizedAttentionOutput,
+        ):
+            if hidden_states_img is not None:
+                raise NotImplementedError("quantized attention-output handoff does not support I2V image context")
+            payload = attention_output.payload.transpose(1, 2).flatten(2, 3)
+            hidden_states = _torchao_tensorwise_linear(
+                attn.to_out[0],
+                payload,
+                attention_output.scale,
+                activation_dtype,
             )
             hidden_states = hidden_states.to(activation_dtype)
             hidden_states = attn.to_out[1](hidden_states)

@@ -115,13 +115,20 @@ def test_profile_contract(
 
 
 def test_auto_infers_dense_mha_v4_profiles():
-    policy = AttentionA2AConfig(profile="auto")
+    policy = AttentionA2AConfig(profile="auto", output="mori")
 
-    assert policy.resolve_for_backend("aiter_mxfp6").profile == "mxfp6-e4m3"
+    resolved = policy.resolve_for_backend("aiter_mxfp6")
+    assert resolved.profile == "mxfp6-e4m3"
+    assert resolved.output == "mori"
     assert policy.resolve_for_backend("aiter_f6f6").profile == "mxfp6-mxfp6"
     assert policy.resolve_for_backend("aiter_f6f4").profile == "mxfp6-mxfp4"
     assert policy.resolve_for_backend("aiter_mxfp4").profile == "mxfp4-mxfp4"
     assert policy.resolve_for_backend("aiter_f4f4").profile == "mxfp4-mxfp4"
+
+
+def test_output_mori_requires_enabled_input_a2a():
+    with pytest.raises(ValueError, match="attention_a2a_output"):
+        AttentionA2AConfig(output="mori")
 
 
 def test_profiles_use_validated_wan_launch_geometry():

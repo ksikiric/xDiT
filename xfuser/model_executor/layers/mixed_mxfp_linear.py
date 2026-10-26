@@ -42,7 +42,7 @@ def _require_api(name: str, value):
     if callable(value):
         return value
     detail = (
-        f": {type(_AITER_MIXED_IMPORT_ERROR).__name__}: " f"{_AITER_MIXED_IMPORT_ERROR}"
+        f": {type(_AITER_MIXED_IMPORT_ERROR).__name__}: {_AITER_MIXED_IMPORT_ERROR}"
         if _AITER_MIXED_IMPORT_ERROR is not None
         else ""
     )
@@ -77,10 +77,7 @@ def _expected_pack_sizes(
     if callable(size_fn):
         actual = tuple(int(value) for value in size_fn(rows, in_features))
         if actual != fallback:
-            raise RuntimeError(
-                f"AITER MXFP{format_[-1]} pack-size ABI mismatch: "
-                f"got {actual}, expected {fallback}"
-            )
+            raise RuntimeError(f"AITER MXFP{format_[-1]} pack-size ABI mismatch: got {actual}, expected {fallback}")
         return actual
     return fallback
 
@@ -92,9 +89,7 @@ def _validate_compute_matrix(
     features: int,
 ) -> None:
     if tensor.ndim != 2 or tensor.shape[1] != features:
-        raise ValueError(
-            f"{name} must have shape [rows, {features}], got {tuple(tensor.shape)}"
-        )
+        raise ValueError(f"{name} must have shape [rows, {features}], got {tuple(tensor.shape)}")
     if tensor.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(f"{name} must use torch.bfloat16, got {tensor.dtype}")
     if tensor.device.type == "meta":
@@ -122,8 +117,7 @@ def _validate_packed_pair(
     actual = (packed.numel(), scale.numel())
     if actual != expected:
         raise ValueError(
-            f"{name} packed sizes {actual} do not match {expected} for "
-            f"logical shape ({rows}, {in_features})"
+            f"{name} packed sizes {actual} do not match {expected} for logical shape ({rows}, {in_features})"
         )
 
 
@@ -142,8 +136,7 @@ def probe_mixed_mxfp_apis() -> tuple[bool, str | None]:
     missing = [name for name, value in required.items() if not callable(value)]
     if missing:
         detail = (
-            f": {type(_AITER_MIXED_IMPORT_ERROR).__name__}: "
-            f"{_AITER_MIXED_IMPORT_ERROR}"
+            f": {type(_AITER_MIXED_IMPORT_ERROR).__name__}: {_AITER_MIXED_IMPORT_ERROR}"
             if _AITER_MIXED_IMPORT_ERROR is not None
             else ""
         )
@@ -169,10 +162,7 @@ def _validate_mixed_output(
     out_features: int,
 ) -> torch.Tensor:
     if tuple(output.shape) != (rows, out_features):
-        raise RuntimeError(
-            f"AITER A6W4 returned {tuple(output.shape)}, expected "
-            f"({rows}, {out_features})"
-        )
+        raise RuntimeError(f"AITER A6W4 returned {tuple(output.shape)}, expected ({rows}, {out_features})")
     if output.dtype is not torch.bfloat16:
         raise RuntimeError(f"AITER A6W4 must return torch.bfloat16, got {output.dtype}")
     return output.contiguous()
@@ -207,9 +197,7 @@ def _run_mixed_gemm(
             dtype=torch.bfloat16,
             device=input_2d.device,
         )
-    activation_packed, activation_scale = _require_api(
-        "quant_mxfp6_gemm", quant_mxfp6_gemm
-    )(input_2d)
+    activation_packed, activation_scale = _require_api("quant_mxfp6_gemm", quant_mxfp6_gemm)(input_2d)
     _validate_packed_pair(
         activation_packed,
         activation_scale,
@@ -267,6 +255,64 @@ def _(
     )
 
 
+@torch.library.custom_op(
+    "xfuser::a6w4_linear_prequantized",
+    mutates_args=(),
+)
+def _a6w4_linear_prequantized(
+    activation_packed: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    rows: int,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    _validate_packed_pair(
+        activation_packed,
+        activation_scale,
+        rows=rows,
+        in_features=in_features,
+        format_="fp6",
+        name="A6W4 activation",
+    )
+    return _require_api("gemm_a6w4", gemm_a6w4)(
+        activation_packed,
+        weight_packed,
+        activation_scale,
+        weight_scale,
+        rows,
+        out_features,
+        in_features,
+    )
+
+
+@_a6w4_linear_prequantized.register_fake
+def _(
+    activation_packed: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    rows: int,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    device = activation_packed.device
+    del (
+        activation_packed,
+        activation_scale,
+        weight_packed,
+        weight_scale,
+        in_features,
+    )
+    return torch.empty(
+        rows,
+        out_features,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+
 class _xFuserMixedMXFPLinear(nn.Module):
     """Inference-only mixed-MXFP linear; subclasses choose operand formats."""
 
@@ -290,13 +336,9 @@ class _xFuserMixedMXFPLinear(nn.Module):
         if dtype not in _SUPPORTED_DTYPES:
             raise TypeError("mixed-MXFP linear dtype must be torch.bfloat16")
         self._compute_dtype = dtype
-        self.weight = nn.Parameter(
-            torch.empty((out_features, in_features), device=device, dtype=dtype)
-        )
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(
-                torch.empty(out_features, device=device, dtype=dtype)
-            )
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
         else:
             self.register_parameter("bias", None)
         self.reset_parameters()
@@ -324,10 +366,7 @@ class _xFuserMixedMXFPLinear(nn.Module):
     ) -> None:
         expected = (self.out_features, self.in_features)
         if weights.ndim != 2 or tuple(weights.shape) != expected:
-            raise ValueError(
-                f"{self.kind.upper()} weight must have shape {expected}, got "
-                f"{tuple(weights.shape)}"
-            )
+            raise ValueError(f"{self.kind.upper()} weight must have shape {expected}, got {tuple(weights.shape)}")
         if weights.dtype not in _SUPPORTED_DTYPES:
             raise TypeError(f"{self.kind.upper()} weight has unsupported dtype")
         target = torch.device(device) if device is not None else weights.device
@@ -341,9 +380,7 @@ class _xFuserMixedMXFPLinear(nn.Module):
         )
         packed = torch.zeros(packed_size, dtype=torch.uint8, device=target)
         scale = torch.zeros(scale_size, dtype=torch.uint8, device=target)
-        _require_api("quant_mxfp4_gemm_hip_out", quant_mxfp4_gemm_hip_out)(
-            full_weight, packed, scale
-        )
+        _require_api("quant_mxfp4_gemm_hip_out", quant_mxfp4_gemm_hip_out)(full_weight, packed, scale)
         _validate_packed_pair(
             packed,
             scale,
@@ -370,9 +407,7 @@ class _xFuserMixedMXFPLinear(nn.Module):
 
     def _quantize_weights(self) -> None:
         if self.weight is None:
-            raise RuntimeError(
-                f"{self.kind.upper()} full-precision weight is unavailable"
-            )
+            raise RuntimeError(f"{self.kind.upper()} full-precision weight is unavailable")
         weight = self.weight.detach()
         bias = self.bias.detach() if self.bias is not None else None
         self.load_and_quantize_weights(weight, bias, device=weight.device)
@@ -392,13 +427,9 @@ class _xFuserMixedMXFPLinear(nn.Module):
         scale_key = prefix + "weight_scale"
         has_packed = packed_key in state_dict or scale_key in state_dict
         if (packed_key in state_dict) != (scale_key in state_dict):
-            raise RuntimeError(
-                f"{self.kind.upper()} packed state requires values and scales"
-            )
+            raise RuntimeError(f"{self.kind.upper()} packed state requires values and scales")
         if has_packed and weight_key in state_dict:
-            raise RuntimeError(
-                f"{self.kind.upper()} state cannot contain full and packed weights"
-            )
+            raise RuntimeError(f"{self.kind.upper()} state cannot contain full and packed weights")
 
         destination = None
         if has_packed:
@@ -412,14 +443,8 @@ class _xFuserMixedMXFPLinear(nn.Module):
                 format_=self.weight_format,
                 name=f"{self.kind.upper()} checkpoint weight",
             )
-            current = (
-                self.weight_packed if hasattr(self, "weight_packed") else self.weight
-            )
-            destination = (
-                incoming_packed.device
-                if current is None or current.device.type == "meta"
-                else current.device
-            )
+            current = self.weight_packed if hasattr(self, "weight_packed") else self.weight
+            destination = incoming_packed.device if current is None or current.device.type == "meta" else current.device
             self._remove_packed_state()
             if hasattr(self, "weight"):
                 delattr(self, "weight")
@@ -438,12 +463,8 @@ class _xFuserMixedMXFPLinear(nn.Module):
             )
         elif weight_key in state_dict:
             incoming = state_dict[weight_key]
-            current = (
-                self.weight_packed if hasattr(self, "weight_packed") else self.weight
-            )
-            destination = (
-                incoming.device if current.device.type == "meta" else current.device
-            )
+            current = self.weight_packed if hasattr(self, "weight_packed") else self.weight
+            destination = incoming.device if current.device.type == "meta" else current.device
             self._remove_packed_state()
             if self.weight is None:
                 delattr(self, "weight")
@@ -452,16 +473,10 @@ class _xFuserMixedMXFPLinear(nn.Module):
                     nn.Parameter(torch.empty_like(incoming, device=destination)),
                 )
             elif self.weight.device.type == "meta":
-                self.weight = nn.Parameter(
-                    torch.empty_like(incoming, device=destination)
-                )
+                self.weight = nn.Parameter(torch.empty_like(incoming, device=destination))
 
         bias_key = prefix + "bias"
-        if (
-            bias_key in state_dict
-            and self.bias is not None
-            and self.bias.device.type == "meta"
-        ):
+        if bias_key in state_dict and self.bias is not None and self.bias.device.type == "meta":
             incoming_bias = state_dict[bias_key]
             self.bias = nn.Parameter(
                 torch.empty_like(
@@ -487,28 +502,21 @@ class _xFuserMixedMXFPLinear(nn.Module):
     ) -> torch.Tensor:
         if self.bias is not None:
             if self.bias.device != output.device or self.bias.dtype != output_dtype:
-                raise ValueError(
-                    f"{self.kind.upper()} bias must match output device and dtype"
-                )
+                raise ValueError(f"{self.kind.upper()} bias must match output device and dtype")
             output = output + self.bias
         return output.contiguous()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim == 0 or input.shape[-1] != self.in_features:
-            raise ValueError(
-                f"{self.kind.upper()} input must end in {self.in_features}"
-            )
+            raise ValueError(f"{self.kind.upper()} input must end in {self.in_features}")
         if input.dtype != self._compute_dtype:
             raise TypeError(
-                f"{self.kind.upper()} input dtype {input.dtype} does not match "
-                f"weight dtype {self._compute_dtype}"
+                f"{self.kind.upper()} input dtype {input.dtype} does not match weight dtype {self._compute_dtype}"
             )
         if not hasattr(self, "weight_packed"):
             self._quantize_weights()
         if input.device != self.weight_packed.device:
-            raise ValueError(
-                f"{self.kind.upper()} input and weight must share a device"
-            )
+            raise ValueError(f"{self.kind.upper()} input and weight must share a device")
         original_shape = input.shape
         input_2d = input.reshape(-1, self.in_features).contiguous()
         output = torch.ops.xfuser.a6w4_linear(
@@ -531,6 +539,28 @@ class _xFuserMixedMXFPLinear(nn.Module):
 class xFuserA6W4Linear(_xFuserMixedMXFPLinear):
     kind = "a6w4"
     weight_format = "fp4"
+    prequantized_input_codec = "mxfp6"
+
+    def forward_prequantized(
+        self,
+        activation_packed: torch.Tensor,
+        activation_scale: torch.Tensor,
+        logical_shape,
+    ) -> torch.Tensor:
+        if not hasattr(self, "weight_packed"):
+            self._quantize_weights()
+        rows = math.prod(logical_shape[:-1])
+        output = torch.ops.xfuser.a6w4_linear_prequantized(
+            activation_packed,
+            activation_scale,
+            self.weight_packed,
+            self.weight_scale,
+            rows,
+            self.out_features,
+            self.in_features,
+        ).to(self._compute_dtype)
+        output = self._add_bias(output, self._compute_dtype)
+        return output.reshape(*logical_shape[:-1], self.out_features).contiguous()
 
 
 __all__ = [
