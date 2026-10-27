@@ -26,12 +26,14 @@ def _parser():
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head_dim", "--head-dim", type=int, default=128)
     parser.add_argument("--out_features", "--out-features", type=int, default=1024)
+    parser.add_argument("--blocks", type=int, default=128)
+    parser.add_argument("--warps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument(
         "--codecs",
         nargs="+",
-        choices=("e4m3", "mxfp4", "mxfp6"),
+        choices=("e4m3", "e4m3_tensor", "mxfp4", "mxfp6"),
         default=("e4m3", "mxfp4", "mxfp6"),
     )
     parser.add_argument(
@@ -42,10 +44,18 @@ def _parser():
     return parser
 
 
-def _reference_quant(input_2d, codec):
+def _reference_quant(input_2d, codec, scale=None):
     if codec == "e4m3":
         quantize = aiter.get_hip_quant(aiter.QuantType.per_1x128)
         return quantize(input_2d, quant_dtype=aiter.dtypes.fp8)
+    if codec == "e4m3_tensor":
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        if scale is None:
+            scale = input_2d.abs().amax().float().clamp(min=1e-12) / fp8_max
+        return (
+            (input_2d.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn),
+            scale.view(1, 1),
+        )
     if codec == "mxfp4":
         quantize = aiter.get_hip_quant(aiter.QuantType.per_1x32)
         return quantize(input_2d, quant_dtype=aiter.dtypes.fp4x2, shuffle=True)
@@ -61,11 +71,16 @@ def _reference_quant(input_2d, codec):
     return quant_mxfp6_gemm_out(input_2d, packed, scale)
 
 
-def _result_operands(result, codec, rows, features):
+def _result_operands(result, codec, rows, features, tensorwise_scale=None):
     if codec == "e4m3":
         return (
             result.payload.view(aiter.dtypes.fp8).view(rows, features),
             result.scale.view(rows, features // 128),
+        )
+    if codec == "e4m3_tensor":
+        return (
+            result.payload.view(torch.float8_e4m3fn).view(rows, features),
+            tensorwise_scale.view(1, 1),
         )
     if codec == "mxfp4":
         return (
@@ -84,7 +99,45 @@ def _gemm_outputs(input_2d, actual, expected, codec, out_features):
         dtype=torch.bfloat16,
         device=input_2d.device,
     )
-    if codec == "e4m3":
+    if codec == "e4m3_tensor":
+        from torchao.quantization.granularity import PerTensor
+        from torchao.quantization.quant_api import (
+            Float8DynamicActivationFloat8WeightConfig,
+            quantize_,
+        )
+        from xfuser.core.utils.runner_utils import FP8_ACTIVATION_SCALE_FLOOR
+        from xfuser.model_executor.models.transformers.transformer_wan import (
+            _torchao_tensorwise_linear,
+        )
+
+        linear = torch.nn.Linear(
+            features,
+            out_features,
+            bias=False,
+            dtype=torch.bfloat16,
+            device=input_2d.device,
+        )
+        with torch.no_grad():
+            linear.weight.copy_(weight)
+        quantize_(
+            linear,
+            config=Float8DynamicActivationFloat8WeightConfig(
+                granularity=PerTensor(),
+                set_inductor_config=False,
+                activation_value_lb=FP8_ACTIVATION_SCALE_FLOOR,
+            ),
+            device=input_2d.device,
+        )
+
+        def run(pair):
+            return _torchao_tensorwise_linear(
+                linear,
+                pair[0].view(1, rows, features),
+                pair[1],
+                torch.bfloat16,
+            ).view(rows, out_features)
+
+    elif codec == "e4m3":
         from xfuser.model_executor.layers.fp8_linear import (
             quantize_weight_to_fp8_blockscale_plain,
         )
@@ -197,6 +250,21 @@ def main():
         reference_matrix = _sequence_major_matrix(reference_bhsd)
         rows, features = reference_matrix.shape
         results = {}
+
+        def destination_tensorwise_scales(input_bshd):
+            batch, sequence, heads_local, head_dim = input_bshd.shape
+            sequence_local = sequence // world_size
+            by_destination = input_bshd.view(
+                batch,
+                world_size,
+                sequence_local,
+                heads_local,
+                head_dim,
+            )
+            amax = by_destination.abs().amax(dim=(0, 2, 3, 4)).float()
+            dist.all_reduce(amax, op=dist.ReduceOp.MAX)
+            return amax.clamp(min=1e-12) / torch.finfo(torch.float8_e4m3fn).max
+
         for codec in args.codecs:
             op = AttentionOutputA2AIntraNodeOp(
                 rank=rank,
@@ -204,15 +272,23 @@ def main():
                 shape=tuple(source.shape),
                 group=cpu_group,
                 codec=codec,
+                block_num=args.blocks,
+                warp_num_per_block=args.warps,
             )
-            actual_result = op(source)
+            tensorwise_scales = destination_tensorwise_scales(source) if codec == "e4m3_tensor" else None
+            actual_result = op(source) if tensorwise_scales is None else op(source, tensorwise_scales=tensorwise_scales)
             actual = _result_operands(
                 actual_result,
                 codec,
                 rows,
                 features,
+                None if tensorwise_scales is None else tensorwise_scales[rank],
             )
-            expected = _reference_quant(reference_matrix, codec)
+            expected = _reference_quant(
+                reference_matrix,
+                codec,
+                None if tensorwise_scales is None else tensorwise_scales[rank],
+            )
             payload_exact = _all_ranks_true(
                 torch.equal(
                     actual[0].view(torch.uint8),
@@ -244,13 +320,26 @@ def main():
                     world_size,
                 )
             )
-            corner_expected = _reference_quant(corner_reference, codec)
-            corner_result = op(corner_source)
+            corner_tensorwise_scales = destination_tensorwise_scales(corner_source) if codec == "e4m3_tensor" else None
+            corner_expected = _reference_quant(
+                corner_reference,
+                codec,
+                (None if corner_tensorwise_scales is None else corner_tensorwise_scales[rank]),
+            )
+            corner_result = (
+                op(corner_source)
+                if corner_tensorwise_scales is None
+                else op(
+                    corner_source,
+                    tensorwise_scales=corner_tensorwise_scales,
+                )
+            )
             corner_actual = _result_operands(
                 corner_result,
                 codec,
                 rows,
                 features,
+                (None if corner_tensorwise_scales is None else corner_tensorwise_scales[rank]),
             )
             corner_payload_exact = _all_ranks_true(
                 torch.equal(
@@ -284,6 +373,13 @@ def main():
                     ),
                     "max_abs": max_abs.item(),
                 }
+
+            def run_output_op():
+                if codec != "e4m3_tensor":
+                    return op(source)
+                scales = destination_tensorwise_scales(source)
+                return op(source, tensorwise_scales=scales)
+
             results[codec] = {
                 "payload_exact": payload_exact,
                 "scales_exact": scales_exact,
@@ -291,7 +387,7 @@ def main():
                 "corner_scales_exact": corner_scales_exact,
                 "gemms": gemm_results,
                 "mori_ms": _measure(
-                    lambda: op(source),
+                    run_output_op,
                     warmup=args.warmup,
                     iterations=args.iterations,
                     device=device,

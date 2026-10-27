@@ -1365,6 +1365,26 @@ def _fused_a2a_output_quantized(
     group = dist.distributed_c10d._resolve_process_group(group_name)
     if dist.get_world_size(group) != world_size:
         raise ValueError("output A2A world size changed after tracing")
+    tensorwise_scales = None
+    if codec == "e4m3_tensor":
+        batch, sequence, heads_local, head_dim = output_bshd.shape
+        if sequence % world_size:
+            raise ValueError("output A2A sequence must divide by world size")
+        sequence_local = sequence // world_size
+        by_destination = output_bshd.view(
+            batch,
+            world_size,
+            sequence_local,
+            heads_local,
+            head_dim,
+        )
+        destination_amax = by_destination.abs().amax(dim=(0, 2, 3, 4)).float()
+        dist.all_reduce(
+            destination_amax,
+            op=dist.ReduceOp.MAX,
+            group=group,
+        )
+        tensorwise_scales = destination_amax.clamp(min=1e-12) / torch.finfo(torch.float8_e4m3fn).max
     op = _get_output_op(
         group,
         rank,
@@ -1373,7 +1393,12 @@ def _fused_a2a_output_quantized(
         output_bshd.device,
         codec,
     )
-    result = op(output_bshd)
+    result = op(output_bshd) if tensorwise_scales is None else op(output_bshd, tensorwise_scales=tensorwise_scales)
+    if tensorwise_scales is not None:
+        return (
+            result.payload,
+            tensorwise_scales[rank : rank + 1].clone().view(1, 1),
+        )
     return result.payload, result.scale
 
 
@@ -1406,6 +1431,11 @@ def _fused_a2a_output_quantized_fake(
         return (
             output_bshd.new_empty((payload_size,), dtype=torch.uint8),
             output_bshd.new_empty((scale_size,), dtype=torch.uint8),
+        )
+    if codec == "e4m3_tensor":
+        return (
+            output_bshd.new_empty(shape, dtype=torch.uint8),
+            output_bshd.new_empty((1, 1), dtype=torch.float32),
         )
     return (
         output_bshd.new_empty(shape, dtype=torch.uint8),

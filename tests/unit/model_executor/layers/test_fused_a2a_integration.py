@@ -188,3 +188,20 @@ def test_runtime_does_not_access_private_aiter_buffers():
     assert "lru_cache" not in source
     assert "_INPUT_CONSUMER_DONE" not in source
     assert "MORI_SHMEM_HEAP_SIZE" not in source
+
+
+def test_tensorwise_output_fake_contract():
+    output = torch.empty(1, 16, 2, 128, dtype=torch.bfloat16)
+
+    payload, scale = fused_a2a_integration._fused_a2a_output_quantized_fake(
+        output,
+        "e4m3_tensor",
+        0,
+        2,
+        "test",
+    )
+
+    assert payload.shape == (1, 8, 4, 128)
+    assert payload.dtype == torch.uint8
+    assert scale.shape == (1, 1)
+    assert scale.dtype == torch.float32

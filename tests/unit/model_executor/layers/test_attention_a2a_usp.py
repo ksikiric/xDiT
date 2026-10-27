@@ -72,6 +72,27 @@ def test_packed_attention_is_traceable_without_an_outer_custom_op():
     assert not hasattr(torch.ops.xfuser, "attention_a2a_packed_attention")
 
 
+def test_detects_torchao_tensorwise_output_codec():
+    weight = type("Float8Tensor", (), {})()
+    weight.shape = (5120, 5120)
+    weight.block_size = [5120, 5120]
+    attn_layer = SimpleNamespace(
+        to_out=[SimpleNamespace(weight=weight)],
+    )
+
+    assert usp._prequantized_output_codec(attn_layer) == "e4m3_tensor"
+
+
+def test_detects_active_torchao_branch_inside_hybrid_linear():
+    weight = type("Float8Tensor", (), {})()
+    weight.shape = (5120, 5120)
+    weight.block_size = [5120, 5120]
+    active = SimpleNamespace(weight=weight)
+    hybrid = SimpleNamespace(_active_linear=lambda: active)
+
+    assert usp._prequantized_output_codec(SimpleNamespace(to_out=[hybrid])) == "e4m3_tensor"
+
+
 def test_routes_packed_a2a_input_and_rccl_output():
     query = torch.randn(1, 4, 8, 128)
     key = torch.randn_like(query)

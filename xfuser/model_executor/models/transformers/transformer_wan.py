@@ -287,18 +287,33 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         if isinstance(attention_output, SequenceMajorPrequantizedAttentionOutput):
             if hidden_states_img is not None:
                 raise NotImplementedError("quantized attention-output handoff does not support I2V image context")
-            if not callable(getattr(attn.to_out[0], "forward_prequantized", None)):
-                raise RuntimeError(
-                    "--attention_a2a_output mori requires a to_out projection with forward_prequantized support"
+            if attention_output.codec == "e4m3_tensor":
+                payload = attention_output.payload.flatten(2, 3)
+                output_linear = attn.to_out[0]
+                active_linear = getattr(output_linear, "_active_linear", None)
+                if callable(active_linear):
+                    output_linear = active_linear()
+                hidden_states = _torchao_tensorwise_linear(
+                    output_linear,
+                    payload,
+                    attention_output.scale,
+                    activation_dtype,
                 )
-            payload = (
-                attention_output.payload.flatten(2, 3) if attention_output.codec == "e4m3" else attention_output.payload
-            )
-            hidden_states = attn.to_out[0].forward_prequantized(
-                payload,
-                attention_output.scale,
-                tuple(hidden_states.shape),
-            )
+            else:
+                if not callable(getattr(attn.to_out[0], "forward_prequantized", None)):
+                    raise RuntimeError(
+                        "--attention_a2a_output mori requires a to_out projection with forward_prequantized support"
+                    )
+                payload = (
+                    attention_output.payload.flatten(2, 3)
+                    if attention_output.codec == "e4m3"
+                    else attention_output.payload
+                )
+                hidden_states = attn.to_out[0].forward_prequantized(
+                    payload,
+                    attention_output.scale,
+                    tuple(hidden_states.shape),
+                )
             hidden_states = hidden_states.to(activation_dtype)
             hidden_states = attn.to_out[1](hidden_states)
             return hidden_states

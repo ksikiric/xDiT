@@ -36,6 +36,10 @@ def fake_aiter_quantization(runtime, monkeypatch):
     monkeypatch.setattr(runtime.module, "shuffle_weight", lambda weight, layout: weight, raising=False)
 
 
+def test_mxfp4_declares_prequantized_output_contract(runtime):
+    assert runtime.module.xFuserMXFP4Linear.prequantized_input_codec == "mxfp4"
+
+
 def test_quantized_weight_is_non_trainable_parameter_and_scale_is_buffer(
     runtime,
     fake_aiter_quantization,

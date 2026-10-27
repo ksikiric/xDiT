@@ -69,12 +69,12 @@ def _(
 
 class xFuserMXFP4Linear(nn.Module):
     """
-    prequantized_input_codec = "mxfp4"
-
     Custom Linear layer using MXFP4 GEMM operation
 
     Drop-in replacement for nn.Linear.
     """
+
+    prequantized_input_codec = "mxfp4"
 
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}

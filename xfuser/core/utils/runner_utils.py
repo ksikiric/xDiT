@@ -12,15 +12,14 @@ logger = logging.getLogger(__name__)
 
 
 def _use_aiter_fp8_rdna4() -> bool:
-    """True where xDiT's AITER FP8 block-scale linear is supported."""
+    """True on ROCm gfx1200 (Navi 44) or gfx1201 (Navi 48) with AITER present."""
     if not _is_hip():
         return False
     try:
         import aiter  # noqa: F401
     except ImportError:
         return False
-    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
-    return "gfx950" in arch or PACKAGES_CHECKER._on_rdna4()
+    return PACKAGES_CHECKER._on_rdna4()
 
 
 def log(message: str, debug=False, log_from_all_processes: bool = False) -> None:

@@ -392,10 +392,20 @@ def _prequantized_output_codec(attn_layer):
     if not to_out:
         return None
     linear = to_out[0]
-    if not callable(getattr(linear, "forward_prequantized", None)):
-        return None
-    codec = getattr(linear, "prequantized_input_codec", None)
-    return codec if codec in {"e4m3", "mxfp4", "mxfp6"} else None
+    active_linear = getattr(linear, "_active_linear", None)
+    if callable(active_linear):
+        linear = active_linear()
+    if callable(getattr(linear, "forward_prequantized", None)):
+        codec = getattr(linear, "prequantized_input_codec", None)
+        return codec if codec in {"e4m3", "mxfp4", "mxfp6"} else None
+    weight = getattr(linear, "weight", None)
+    if type(weight).__name__ == "Float8Tensor" and getattr(
+        weight,
+        "block_size",
+        None,
+    ) == list(weight.shape):
+        return "e4m3_tensor"
+    return None
 
 
 def _preprocess_joint_tensors(joint_key, joint_value):
@@ -762,7 +772,7 @@ def _attention_a2a_packed_attn_call(
     v_scales: torch.Tensor,
     profile: str,
     softmax_scale: float,
-    output_codec: str | None,
+    output_codec: str | None = None,
 ) -> torch.Tensor:
     out = launch_attention_a2a_packed(
         q_packed,
@@ -785,6 +795,8 @@ def _attention_a2a_packed_attn_call(
         )
         if output_codec == "e4m3":
             payload = payload.view(aiter.dtypes.fp8)
+        elif output_codec == "e4m3_tensor":
+            payload = payload.view(torch.float8_e4m3fn)
         elif output_codec == "mxfp4":
             payload = payload.view(aiter.dtypes.fp4x2)
             scale = scale.view(aiter.dtypes.fp8_e8m0)
