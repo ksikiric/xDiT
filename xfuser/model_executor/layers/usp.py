@@ -46,12 +46,18 @@ from xfuser.core.sparge_attention.head_balance import (
 from xfuser.model_executor.layers.fused_a2a_integration import (
     fused_a2a_input,
     fused_a2a_input_role,
+    fused_a2a_output,
     get_fused_a2a_codecs,
     get_fused_a2a_mode,
     get_fused_a2a_profile,
     launch_attention_a2a_packed,
     use_fused_a2a_interleave,
+    use_fused_a2a_output,
     use_fused_a2a_packed,
+)
+from xfuser.model_executor.layers.quantized_attention_output import (
+    QuantizedAttentionOutput,
+    attention_output_codec,
 )
 
 # Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
@@ -722,7 +728,8 @@ def _attention_a2a_packed_attn_call(
     v_scales: torch.Tensor,
     profile: str,
     softmax_scale: float,
-) -> torch.Tensor:
+    output_codec: str | None = None,
+) -> torch.Tensor | QuantizedAttentionOutput:
     out = launch_attention_a2a_packed(
         q_packed,
         k_packed,
@@ -733,6 +740,14 @@ def _attention_a2a_packed_attn_call(
         profile,
         softmax_scale,
     )
+    if output_codec is not None:
+        payload, scale = fused_a2a_output(
+            out,
+            PROCESS_GROUP.ULYSSES_PG,
+            get_ulysses_parallel_rank(),
+            output_codec,
+        )
+        return QuantizedAttentionOutput(payload, scale, output_codec)
     return out.transpose(1, 2)
 
 
@@ -907,6 +922,7 @@ def USP(
     kv_head_repeat: int = 1,
     attention_a2a_enabled: bool = False,
     attention_a2a_pending=None,
+    output_projection=None,
 ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -935,6 +951,12 @@ def USP(
     the Ulysses input all-to-all, then repeats each local KV head immediately
     before attention. With ``combine_qkv_a2a=True``, unequal Q and KV payloads
     are packed into one collective.
+
+    ``output_projection`` (optional) is the linear that consumes the attention
+    output. Passing it requires the Attention A2A output hop: USP then quantizes
+    the MHA output for that projection's GEMM, performs the inverse all-to-all
+    through MoRI, and returns a ``QuantizedAttentionOutput`` for
+    ``project_attention_output`` instead of the BF16 output.
     """
     if combine_qkv_a2a is None:
         combine_qkv_a2a = False
@@ -955,6 +977,16 @@ def USP(
     use_attention_a2a = attention_a2a_enabled and get_fused_a2a_mode() > 0
     if attention_a2a_pending is not None and not (use_attention_a2a and use_fused_a2a_interleave()):
         raise ValueError("interleaved input requires eligible Attention A2A transport")
+    attention_a2a_output_codec = None
+    if output_projection is not None:
+        if not (use_attention_a2a and use_fused_a2a_output()):
+            raise ValueError("output_projection requires the Attention A2A output hop")
+        attention_a2a_output_codec = attention_output_codec(output_projection)
+        if attention_a2a_output_codec is None:
+            raise RuntimeError(
+                "--attention_a2a_output mori requires a quantized output projection; "
+                f"{type(output_projection).__name__} consumes a BF16 activation"
+            )
 
     hb_backend = backend if backend is not None else runtime_state.attention_backend
     attention_a2a_profile = None
@@ -1192,7 +1224,10 @@ def USP(
                 *packed_scales,
                 attention_a2a_profile,
                 query.shape[-1] ** -0.5,
+                attention_a2a_output_codec,
             )
+            if attention_a2a_output_codec is not None:
+                return out
         elif ring_world_size == 1:  # Ulysses only
             out, _ = attention_function(
                 query,
