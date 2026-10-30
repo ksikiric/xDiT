@@ -18,6 +18,11 @@ from xfuser.model_executor.layers.fused_a2a_integration import (
     get_fused_a2a_hadamard_placement,
     get_fused_a2a_mode,
     use_fused_a2a_interleave,
+    use_fused_a2a_output,
+)
+from xfuser.model_executor.layers.quantized_attention_output import (
+    QuantizedAttentionOutput,
+    project_attention_output,
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.core.distributed import (
@@ -236,21 +241,29 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 attention_a2a_enabled=(get_fused_a2a_mode() > 0 and not self.is_cross_attention),
                 attention_a2a_pending=attention_a2a_pending,
             )
+            if use_fused_a2a_output() and not self.is_cross_attention:
+                if hidden_states_img is not None:
+                    raise NotImplementedError("--attention_a2a_output does not support image context")
+                attention_call_kwargs["output_projection"] = attn.to_out[0]
 
-        hidden_states = self.attention_function(
+        attention_output = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
             **attention_call_kwargs,
-        ).transpose(1, 2)
+        )
 
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(activation_dtype)
+        if isinstance(attention_output, QuantizedAttentionOutput):
+            logical_shape = (*query.shape[:2], query.shape[2] * query.shape[3])
+            hidden_states = project_attention_output(attn.to_out[0], attention_output, logical_shape)
+        else:
+            hidden_states = attention_output.transpose(1, 2).flatten(2, 3)
+            hidden_states = hidden_states.to(activation_dtype)
 
-        if hidden_states_img is not None:
-            hidden_states = hidden_states + hidden_states_img
+            if hidden_states_img is not None:
+                hidden_states = hidden_states + hidden_states_img
 
-        hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
 
