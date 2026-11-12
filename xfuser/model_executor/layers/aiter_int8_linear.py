@@ -244,7 +244,8 @@ def _aiter_int8_gemm_prep(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Projection with Wan's Q/K prep in the epilogue; see compile_int8_gemm_4w(prep=True).
 
-    Returns the BF16 output without the RMS factor and FP32 per-head sums of squares.
+    Returns the BF16 output without the RMS factor and FP32 [2, rows, heads] partials:
+    per-head sums of squares of the projection, then per-head maxima of the output.
     """
     import flydsl.expr as fx
 
@@ -256,7 +257,7 @@ def _aiter_int8_gemm_prep(
     variant = select_aiter_int8_variant(m, n, k, get_cu_num())
     executable = _compile_4wave_prep(k, variant.persistent)
     output = torch.empty((m, n), dtype=torch.bfloat16, device=x_quantized.device)
-    partials = torch.empty((m, n // 128), dtype=torch.float32, device=x_quantized.device)
+    partials = torch.empty((2, m, n // 128), dtype=torch.float32, device=x_quantized.device)
     # Flat views: FlyDSL indexes a 2-D tensor argument column-major.
     _run_compiled(
         executable,
@@ -280,7 +281,7 @@ def _(x_quantized, x_scale, weight_preshuffled, columns, cos_pairs, sin_pairs):
     m, n = x_quantized.shape[0], weight_preshuffled.shape[0]
     return (
         x_quantized.new_empty((m, n), dtype=torch.bfloat16),
-        x_quantized.new_empty((m, n // 128), dtype=torch.float32),
+        x_quantized.new_empty((2, m, n // 128), dtype=torch.float32),
     )
 
 
@@ -468,7 +469,7 @@ class xFuserAiterInt8Linear(nn.Module):
         output, partials = torch.ops.xfuser.aiter_int8_gemm_prep(
             *quantized, self.weight_int8, columns, cos_pairs, sin_pairs
         )
-        factor = torch.rsqrt(partials.sum(-1) / self.out_features + eps)
+        factor = torch.rsqrt(partials[0].sum(-1) / self.out_features + eps)
         return output.reshape(*input.shape[:-1], self.out_features), factor
 
     def extra_repr(self) -> str:
