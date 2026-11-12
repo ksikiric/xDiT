@@ -75,7 +75,9 @@ def _legacy_kv_tile() -> int:
         from aiter.ops.mha_v4 import mha_v4_kv_tile
 
         return int(mha_v4_kv_tile())
-    except ImportError:
+    # Newer AITER raises ValueError when its gfx950 rows disagree and no recipe is named;
+    # 128 is the tile of every non-BF16 recipe there.
+    except (ImportError, ValueError):
         return 64 if "gfx942" in device_arch() else 128
 
 
