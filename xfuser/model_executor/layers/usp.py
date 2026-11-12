@@ -574,6 +574,7 @@ def usp_fused_a2a_input_role(
     role,
     pending=None,
     valid_kv_len=None,
+    row_scale=None,
 ):
     """Submit one sequence-major Wan role to the active Ulysses A2A input hop."""
     return fused_a2a_input_role(
@@ -583,23 +584,26 @@ def usp_fused_a2a_input_role(
         get_ulysses_parallel_rank(),
         pending,
         valid_kv_len,
+        row_scale,
     )
 
 
-def usp_fused_a2a_input_q(input, valid_kv_len=None):
+def usp_fused_a2a_input_q(input, valid_kv_len=None, row_scale=None):
     return usp_fused_a2a_input_role(
         input,
         0,
         valid_kv_len=valid_kv_len,
+        row_scale=row_scale,
     )
 
 
-def usp_fused_a2a_input_k(input, pending, valid_kv_len=None):
+def usp_fused_a2a_input_k(input, pending, valid_kv_len=None, row_scale=None):
     return usp_fused_a2a_input_role(
         input,
         1,
         pending,
         valid_kv_len,
+        row_scale,
     )
 
 

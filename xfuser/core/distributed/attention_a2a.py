@@ -1,6 +1,7 @@
 """Feature-gated MoRI fused all-to-all integration for Wan USP."""
 
 import inspect
+import os
 import socket
 
 import torch
@@ -214,7 +215,7 @@ def _register_input_collective():
     lib.define(
         "fused_a2a_input_collective(Tensor input, Tensor lifetime, "
         "Tensor[] previous, int role, str profile, int rank, "
-        "int world_size, int? valid_kv_len, str group_name) -> Tensor[]",
+        "int world_size, int? valid_kv_len, str group_name, Tensor? row_scale=None) -> Tensor[]",
         tags=(torch.Tag.cudagraph_unsafe,),
     )
     lib.define(
@@ -222,7 +223,8 @@ def _register_input_collective():
         tags=(torch.Tag.cudagraph_unsafe,),
     )
 
-    def submit(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name):
+    def submit(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name,
+               row_scale=None):
         del lifetime, previous, world_size
         _require_active_profile(profile)
         group = dist.distributed_c10d._resolve_process_group(group_name)
@@ -237,6 +239,7 @@ def _register_input_collective():
             rank,
             pending,
             valid_kv_len,
+            row_scale,
         )
         _INPUT_PENDING[handle] = pending
         result = pending["results"][-1]
@@ -250,7 +253,8 @@ def _register_input_collective():
             _INPUT_COLLECTIVE_WAITS[tensor.data_ptr()] = (trio, handle, role)
         return [payload, scale]
 
-    def submit_fake(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name):
+    def submit_fake(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name,
+                    row_scale=None):
         del lifetime, previous, group_name, rank
         head_major = input.transpose(1, 2)
         payloads, scales = fake_packed_raw_outputs(
@@ -275,7 +279,8 @@ def _register_input_collective():
         has_side_effect(op)
 
     @register_lowering(submit_op, type_promotion_kind=None)
-    def lower_submit(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name):
+    def lower_submit(input, lifetime, previous, role, profile, rank, world_size, valid_kv_len, group_name,
+                     row_scale=None):
         outputs = ir._CollectiveKernel.create_out_of_place(
             submit_op,
             input,
@@ -287,6 +292,9 @@ def _register_input_collective():
             world_size,
             valid_kv_len,
             group_name,
+            # Inductor reads the group name as the last constant argument, so a missing
+            # row_scale stays out rather than trailing it as None.
+            *(() if row_scale is None else (row_scale,)),
         )
         return [ir.TensorBox.create(output) for output in outputs]
 
@@ -650,6 +658,10 @@ def use_fused_a2a_interleave():
     return _FUSED_A2A_INTERLEAVE and _FUSED_A2A_SIDESTREAM and _FUSED_A2A_PACKED
 
 
+# Q/K from the AITER INT8 prep epilogue arrive without their RMS factor (see aiter_int8_linear).
+_ROW_SCALED_QK = os.environ.get("XFUSER_AITER_INT8_EPILOGUE_PREP") == "1"
+
+
 def fused_a2a_input_role(
     input,
     role,
@@ -657,6 +669,7 @@ def fused_a2a_input_role(
     rank,
     pending=None,
     valid_kv_len=None,
+    row_scale=None,
 ):
     """Submit one role, retaining only a traceable handle outside the opaque op."""
     world_size = dist.get_world_size(group)
@@ -678,6 +691,7 @@ def fused_a2a_input_role(
             world_size,
             valid_kv_len,
             group.group_name,
+            row_scale,
         )
         return (*previous, *outputs)
     handle = (group.group_name, rank, input.device.index)
@@ -690,6 +704,7 @@ def fused_a2a_input_role(
         group.group_name,
         rank,
         valid_kv_len,
+        row_scale,
     )
     return (*handle, role + 1)
 
@@ -706,6 +721,7 @@ def _fused_a2a_submit_role(
     group_name: str,
     rank: int,
     valid_kv_len: int | None,
+    row_scale: torch.Tensor | None = None,
 ) -> None:
     # The ordered effect owns peer buffers, handshake state and host parity. CUDA
     # graph replay would bypass those host updates and the runtime pending bridge.
@@ -723,6 +739,7 @@ def _fused_a2a_submit_role(
             rank,
             pending,
             valid_kv_len,
+            row_scale,
         )
     except Exception as exc:
         global _ATTENTION_A2A_POISONED
@@ -739,6 +756,7 @@ def _fused_a2a_submit_role_fake(
     group_name,
     rank,
     valid_kv_len,
+    row_scale=None,
 ):
     return None
 
@@ -757,8 +775,13 @@ def _submit_input_role(
     rank,
     pending=None,
     valid_kv_len=None,
+    row_scale=None,
 ):
-    """Submit one already-normalized sequence-major role without a compute join."""
+    """Submit one already-normalized sequence-major role without a compute join.
+
+    ``row_scale`` (Q and K, with XFUSER_AITER_INT8_EPILOGUE_PREP) is the per-row factor the
+    producer left out.
+    """
     if not use_fused_a2a_interleave():
         raise RuntimeError("per-role input requires quantized sidestream interleave")
     if role == 0:
@@ -793,7 +816,10 @@ def _submit_input_role(
     # Raw-pointer launchers do not inform the caching allocator about side reads.
     input.record_stream(side)
     pending["inputs"].append(input)
-    result = pending["op"].submit_role(role, input, stream=side)
+    if row_scale is not None:
+        row_scale.record_stream(side)
+        pending["inputs"].append(row_scale)
+    result = pending["op"].submit_role(role, input, stream=side, row_scale=row_scale)
     if (
         result is None
         or not torch.is_tensor(getattr(result, "payload", None))
@@ -874,6 +900,7 @@ def _get_ops(
         _TRANSPORT_HADAMARD,
         _ATTENTION_A2A_CONFIG.block_num,
         valid_kv_len,
+        _ROW_SCALED_QK,
     )
     op = _OP_CACHE.get(key)
     if op is None:
@@ -894,6 +921,7 @@ def _get_ops(
             softmax_scale=softmax_scale,
             hadamard=_TRANSPORT_HADAMARD,
             valid_kv_len=valid_kv_len,
+            row_scaled_qk=_ROW_SCALED_QK,
             group=_MORI_CPU_GROUP,
         )
         _OP_CACHE[key] = op

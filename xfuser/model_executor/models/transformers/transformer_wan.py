@@ -39,7 +39,12 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     _HAS_FLYDSL,
 )
 from xfuser.model_executor.layers import usp_sdma
-from xfuser.model_executor.layers.aiter_int8_linear import quantize_shared_input
+from xfuser.model_executor.layers.aiter_int8_linear import (
+    EPILOGUE_PREP,
+    quantize_shared_input,
+    rope_pairs,
+    xFuserAiterInt8Linear,
+)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
@@ -214,7 +219,27 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         pending = None
         interleave = use_fused_a2a_interleave() and not attn.fused_projections
 
-        if interleave:
+        epilogue_prep = (
+            interleave
+            and EPILOGUE_PREP
+            and hadamard_placement == "preprocess"
+            and all(isinstance(m, xFuserAiterInt8Linear) for m in (attn.to_q, attn.to_k))
+        )
+        if epilogue_prep:
+            # Norm weight, RoPE and Hadamard run in the projection GEMM's epilogue; the
+            # A2A push applies the per-row RMS factor.
+            shared = quantize_shared_input((attn.to_q, attn.to_k, attn.to_v), hidden_states)
+            head_dim = attn.to_q.out_features // attn.heads
+            cos_pairs, sin_pairs = rope_pairs(rotary_emb[0], rotary_emb[1], head_dim)
+            query, factor = attn.to_q.forward_prep(hidden_states, shared, attn.norm_q, cos_pairs, sin_pairs)
+            query = query.unflatten(2, (attn.heads, -1))
+            pending = usp_fused_a2a_input_q(query, valid_kv_len, row_scale=factor)
+            key, factor = attn.to_k.forward_prep(hidden_states, shared, attn.norm_k, cos_pairs, sin_pairs)
+            key = key.unflatten(2, (attn.heads, -1))
+            pending = usp_fused_a2a_input_k(key, pending, valid_kv_len, row_scale=factor)
+            value = _project(attn.to_v, hidden_states, shared).unflatten(2, (attn.heads, -1))
+            pending = usp_fused_a2a_input_v(value, pending, valid_kv_len)
+        elif interleave:
             # Submit each role on the transport stream while the next
             # projection is still running on the compute stream.
             shared = quantize_shared_input((attn.to_q, attn.to_k, attn.to_v), hidden_states)

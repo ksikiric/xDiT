@@ -17,6 +17,7 @@ _PRESHUFFLE_LAYOUT = (16, 16)
 # Read once at import: an environment read per call would land inside the traced region.
 _FUSED_BIAS = os.environ.get("XFUSER_AITER_INT8_FUSED_BIAS") == "1"
 _SHARED_QUANT = os.environ.get("XFUSER_AITER_INT8_SHARED_QUANT") == "1"
+EPILOGUE_PREP = os.environ.get("XFUSER_AITER_INT8_EPILOGUE_PREP") == "1"
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,78 @@ def _(
     )
 
 
+@functools.lru_cache(maxsize=4)
+def _compile_4wave_prep(k: int, persistent: bool):
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import compile_int8_gemm_4w
+
+    return compile_int8_gemm_4w(
+        K=k,
+        xcd_swizzle=8,
+        num_cu=get_cu_num() if persistent else 0,
+        bias=True,
+        prep=True,
+    )
+
+
+@torch.library.custom_op("xfuser::aiter_int8_gemm_prep", mutates_args=())
+def _aiter_int8_gemm_prep(
+    x_quantized: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_preshuffled: torch.Tensor,
+    columns: torch.Tensor,
+    cos_pairs: torch.Tensor,
+    sin_pairs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Projection with Wan's Q/K prep in the epilogue; see compile_int8_gemm_4w(prep=True).
+
+    Returns the BF16 output without the RMS factor and FP32 per-head sums of squares.
+    """
+    import flydsl.expr as fx
+
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    m, k = x_quantized.shape
+    n = weight_preshuffled.shape[0]
+    variant = select_aiter_int8_variant(m, n, k, get_cu_num())
+    executable = _compile_4wave_prep(k, variant.persistent)
+    output = torch.empty((m, n), dtype=torch.bfloat16, device=x_quantized.device)
+    partials = torch.empty((m, n // 128), dtype=torch.float32, device=x_quantized.device)
+    # Flat views: FlyDSL indexes a 2-D tensor argument column-major.
+    _run_compiled(
+        executable,
+        x_quantized.view(-1),
+        weight_preshuffled.view(-1),
+        output.view(-1),
+        x_scale.reshape(-1),
+        columns.reshape(-1),
+        cos_pairs.reshape(-1),
+        sin_pairs.reshape(-1),
+        partials.view(-1),
+        m,
+        n,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    return output, partials
+
+
+@_aiter_int8_gemm_prep.register_fake
+def _(x_quantized, x_scale, weight_preshuffled, columns, cos_pairs, sin_pairs):
+    m, n = x_quantized.shape[0], weight_preshuffled.shape[0]
+    return (
+        x_quantized.new_empty((m, n), dtype=torch.bfloat16),
+        x_quantized.new_empty((m, n // 128), dtype=torch.float32),
+    )
+
+
+def rope_pairs(freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, head_dim: int):
+    """Wan's interleaved cos/sin tables as one FP32 value per rotation pair, [rows, head_dim / 2]."""
+    cos = freqs_cos.reshape(-1, head_dim)[:, 0::2].float().contiguous()
+    sin = freqs_sin.reshape(-1, head_dim)[:, 1::2].float().contiguous()
+    return cos, sin
+
+
 def quantize_shared_input(linears, input: torch.Tensor):
     """Quantize ``input`` once for AITER INT8 linears that all read it, or return None."""
     if not _SHARED_QUANT or not all(
@@ -377,6 +450,26 @@ class xFuserAiterInt8Linear(nn.Module):
         if self.bias is not None and not fused_bias:
             output = output + self.bias
         return output.reshape(*original_shape[:-1], self.out_features)
+
+    def forward_prep(self, input, quantized, norm, cos_pairs, sin_pairs):
+        """Wan Q/K projection with RMSNorm weight, RoPE and Hadamard in the GEMM epilogue.
+
+        Returns the BF16 output without the RMS factor, and that factor per row (FP32),
+        which the attention A2A push applies.
+        """
+        if quantized is None:
+            quantized = torch.ops.xfuser.aiter_int8_quantize_rows(
+                input.reshape(-1, self.in_features).contiguous()
+            )
+        eps = norm.eps if norm.eps is not None else torch.finfo(torch.float32).eps
+        columns = torch.cat(
+            [self.weight_scale, self.bias.float(), norm.weight.float() * 128**-0.5]
+        )
+        output, partials = torch.ops.xfuser.aiter_int8_gemm_prep(
+            *quantized, self.weight_int8, columns, cos_pairs, sin_pairs
+        )
+        factor = torch.rsqrt(partials.sum(-1) / self.out_features + eps)
+        return output.reshape(*input.shape[:-1], self.out_features), factor
 
     def extra_repr(self) -> str:
         return (
