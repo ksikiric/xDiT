@@ -548,8 +548,15 @@ _GROUPED = "_xfuser_sdma_qkv"
 
 
 def plain_linear(module) -> bool:
-    # Quantized GEMMs replace the module; sharded (FSDP) weights are DTensors with placements.
-    return type(module) is torch.nn.Linear and not hasattr(module.weight, "placements")
+    # Quantized GEMMs replace the module (AITER) or its weight with a tensor subclass (TorchAO);
+    # sharded (FSDP) weights are DTensors with placements.
+    # type(), unlike hasattr(), still sees a tensor subclass while torch.compile traces.
+    weight = getattr(module, "weight", None)
+    return (
+        type(module) is torch.nn.Linear
+        and type(weight) in (torch.nn.Parameter, torch.Tensor)
+        and not hasattr(weight, "placements")
+    )
 
 
 def _qkv_parts(attn):

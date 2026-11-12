@@ -412,6 +412,8 @@ class xFuserWanSdmaAttnProcessor(xFuserWanAttnProcessor):
         if hidden_states.device.type != "cuda" or hidden_states.dtype != torch.bfloat16 or hidden_states.shape[0] != 1:
             return False
         linears = (attn.to_q, attn.to_k, attn.to_v)
+        if not all(usp_sdma.plain_linear(m) for m in linears):
+            return False
         if len({m.weight.shape for m in linears}) != 1 or attn.to_q.weight.shape[0] % attn.heads:
             return False
         for module in linears:
