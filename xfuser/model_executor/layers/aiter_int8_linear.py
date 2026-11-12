@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,6 +14,9 @@ _BLOCK_M = 256
 _BLOCK_N = 256
 _K_TILE = 128
 _PRESHUFFLE_LAYOUT = (16, 16)
+# Read once at import: an environment read per call would land inside the traced region.
+_FUSED_BIAS = os.environ.get("XFUSER_AITER_INT8_FUSED_BIAS") == "1"
+_SHARED_QUANT = os.environ.get("XFUSER_AITER_INT8_SHARED_QUANT") == "1"
 
 
 @dataclass(frozen=True)
@@ -96,7 +100,7 @@ def _quantize_rows_int8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 
 
 @functools.lru_cache(maxsize=16)
-def _compile_4wave(k: int, persistent: bool):
+def _compile_4wave(k: int, persistent: bool, bias: bool = False):
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import (
         compile_int8_gemm_4w,
@@ -106,31 +110,28 @@ def _compile_4wave(k: int, persistent: bool):
         K=k,
         xcd_swizzle=8,
         num_cu=get_cu_num() if persistent else 0,
+        bias=bias,
     )
 
 
-@torch.library.custom_op("xfuser::aiter_int8_gemm", mutates_args=())
-def _aiter_int8_gemm(
-    input_2d: torch.Tensor,
+def _launch_int8_gemm(
+    x_quantized: torch.Tensor,
+    x_scale: torch.Tensor,
     weight_preshuffled: torch.Tensor,
-    weight_scale: torch.Tensor,
+    column_scales: torch.Tensor,
+    bias: bool,
 ) -> torch.Tensor:
     import flydsl.expr as fx
 
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-    if input_2d.dim() != 2 or weight_preshuffled.dim() != 2:
-        raise ValueError("AITER INT8 GEMM operands must be two-dimensional")
-    if input_2d.dtype != torch.bfloat16:
-        raise TypeError("AITER INT8 GEMM activation must use torch.bfloat16")
-    m, k = input_2d.shape
+    m, k = x_quantized.shape
     n, weight_k = weight_preshuffled.shape
     if weight_k != k:
         raise ValueError(f"AITER INT8 GEMM K mismatch: {k} and {weight_k}")
     variant = select_aiter_int8_variant(m, n, k, get_cu_num())
-    executable = _compile_4wave(k, variant.persistent)
-    x_quantized, x_scale = _quantize_rows_int8(input_2d)
+    executable = _compile_4wave(k, variant.persistent, bias)
     output = torch.empty(
         (m, n),
         dtype=torch.bfloat16,
@@ -142,12 +143,26 @@ def _aiter_int8_gemm(
         weight_preshuffled.view(-1),
         output.view(-1),
         x_scale.reshape(-1),
-        weight_scale.reshape(-1),
+        column_scales.reshape(-1),
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
     )
     return output
+
+
+@torch.library.custom_op("xfuser::aiter_int8_gemm", mutates_args=())
+def _aiter_int8_gemm(
+    input_2d: torch.Tensor,
+    weight_preshuffled: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    if input_2d.dim() != 2 or weight_preshuffled.dim() != 2:
+        raise ValueError("AITER INT8 GEMM operands must be two-dimensional")
+    if input_2d.dtype != torch.bfloat16:
+        raise TypeError("AITER INT8 GEMM activation must use torch.bfloat16")
+    x_quantized, x_scale = _quantize_rows_int8(input_2d)
+    return _launch_int8_gemm(x_quantized, x_scale, weight_preshuffled, weight_scale, False)
 
 
 @_aiter_int8_gemm.register_fake
@@ -160,6 +175,57 @@ def _(
         (input_2d.shape[0], weight_preshuffled.shape[0]),
         dtype=torch.bfloat16,
         device=input_2d.device,
+    )
+
+
+@torch.library.custom_op("xfuser::aiter_int8_quantize_rows", mutates_args=())
+def _aiter_int8_quantize_rows(input_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return _quantize_rows_int8(input_2d)
+
+
+@_aiter_int8_quantize_rows.register_fake
+def _(input_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(input_2d, dtype=torch.int8),
+        input_2d.new_empty((input_2d.shape[0],), dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op("xfuser::aiter_int8_gemm_quantized", mutates_args=())
+def _aiter_int8_gemm_quantized(
+    x_quantized: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_preshuffled: torch.Tensor,
+    column_scales: torch.Tensor,
+    bias: bool,
+) -> torch.Tensor:
+    """``column_scales`` holds the N weight scales, then N FP32 biases when ``bias``."""
+    return _launch_int8_gemm(x_quantized, x_scale, weight_preshuffled, column_scales, bias)
+
+
+@_aiter_int8_gemm_quantized.register_fake
+def _(
+    x_quantized: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_preshuffled: torch.Tensor,
+    column_scales: torch.Tensor,
+    bias: bool,
+) -> torch.Tensor:
+    return torch.empty(
+        (x_quantized.shape[0], weight_preshuffled.shape[0]),
+        dtype=torch.bfloat16,
+        device=x_quantized.device,
+    )
+
+
+def quantize_shared_input(linears, input: torch.Tensor):
+    """Quantize ``input`` once for AITER INT8 linears that all read it, or return None."""
+    if not _SHARED_QUANT or not all(
+        isinstance(m, xFuserAiterInt8Linear) and hasattr(m, "weight_int8") for m in linears
+    ):
+        return None
+    return torch.ops.xfuser.aiter_int8_quantize_rows(
+        input.reshape(-1, input.shape[-1]).contiguous()
     )
 
 
@@ -222,6 +288,8 @@ class xFuserAiterInt8Linear(nn.Module):
             delattr(self, "weight_int8")
         if hasattr(self, "weight_scale"):
             delattr(self, "weight_scale")
+        if hasattr(self, "column_scales_bias"):
+            delattr(self, "column_scales_bias")
         if self.weight is not None:
             delattr(self, "weight")
             self.register_parameter("weight", None)
@@ -263,8 +331,19 @@ class xFuserAiterInt8Linear(nn.Module):
         self._install_quantized_state(weight_preshuffled, weight_scale)
         if bias is not None and self.bias is not None:
             self.bias = nn.Parameter(bias.detach().to(target))
+        if _FUSED_BIAS and self.bias is not None:
+            self.register_buffer(
+                "column_scales_bias",
+                torch.cat([self.weight_scale, self.bias.detach().float()]),
+                persistent=False,
+            )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input: torch.Tensor,
+        quantized: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """``quantized`` is ``input`` already quantized by ``quantize_shared_input``."""
         if input.shape[-1] != self.in_features:
             raise ValueError(
                 f"AITER INT8 input has {input.shape[-1]} features, "
@@ -276,13 +355,26 @@ class xFuserAiterInt8Linear(nn.Module):
             self.load_and_quantize_weights(self.weight)
 
         original_shape = input.shape
-        input_2d = input.reshape(-1, self.in_features).contiguous()
-        output = torch.ops.xfuser.aiter_int8_gemm(
-            input_2d,
-            self.weight_int8,
-            self.weight_scale,
-        )
-        if self.bias is not None:
+        fused_bias = hasattr(self, "column_scales_bias")
+        if quantized is None and not fused_bias:
+            input_2d = input.reshape(-1, self.in_features).contiguous()
+            output = torch.ops.xfuser.aiter_int8_gemm(
+                input_2d,
+                self.weight_int8,
+                self.weight_scale,
+            )
+        else:
+            if quantized is None:
+                quantized = torch.ops.xfuser.aiter_int8_quantize_rows(
+                    input.reshape(-1, self.in_features).contiguous()
+                )
+            output = torch.ops.xfuser.aiter_int8_gemm_quantized(
+                *quantized,
+                self.weight_int8,
+                self.column_scales_bias if fused_bias else self.weight_scale,
+                fused_bias,
+            )
+        if self.bias is not None and not fused_bias:
             output = output + self.bias
         return output.reshape(*original_shape[:-1], self.out_features)
 

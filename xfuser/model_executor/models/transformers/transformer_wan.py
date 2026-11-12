@@ -39,9 +39,14 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     _HAS_FLYDSL,
 )
 from xfuser.model_executor.layers import usp_sdma
+from xfuser.model_executor.layers.aiter_int8_linear import quantize_shared_input
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+
+
+def _project(linear, hidden_states, shared):
+    return linear(hidden_states) if shared is None else linear(hidden_states, quantized=shared)
 
 
 @xFuserAttentionProcessorRegister.register(WanAttnProcessor)
@@ -78,6 +83,11 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 # In cross-attention layers, we can only fuse the KV projections into a single linear
                 query = attn.to_q(hidden_states)
                 key, value = attn.to_kv(encoder_hidden_states).chunk(2, dim=-1)
+        elif encoder_hidden_states is hidden_states:
+            shared = quantize_shared_input((attn.to_q, attn.to_k, attn.to_v), hidden_states)
+            query = _project(attn.to_q, hidden_states, shared)
+            key = _project(attn.to_k, hidden_states, shared)
+            value = _project(attn.to_v, hidden_states, shared)
         else:
             query = attn.to_q(hidden_states)
             key = attn.to_k(encoder_hidden_states)
@@ -207,7 +217,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         if interleave:
             # Submit each role on the transport stream while the next
             # projection is still running on the compute stream.
-            query = attn.to_q(hidden_states)
+            shared = quantize_shared_input((attn.to_q, attn.to_k, attn.to_v), hidden_states)
+            query = _project(attn.to_q, hidden_states, shared)
             query, _ = fused_qk_norm_rope(
                 query,
                 query,
@@ -223,7 +234,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 query = wan_flydsl_hadamard(query)
             pending = usp_fused_a2a_input_q(query, valid_kv_len)
 
-            key = attn.to_k(hidden_states)
+            key = _project(attn.to_k, hidden_states, shared)
             key, _ = fused_qk_norm_rope(
                 key,
                 key,
@@ -239,7 +250,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 key = wan_flydsl_hadamard(key)
             pending = usp_fused_a2a_input_k(key, pending, valid_kv_len)
 
-            value = attn.to_v(hidden_states).unflatten(2, (attn.heads, -1))
+            value = _project(attn.to_v, hidden_states, shared).unflatten(2, (attn.heads, -1))
             pending = usp_fused_a2a_input_v(value, pending, valid_kv_len)
         else:
             query, key, value = self._get_qkv_projections(attn, hidden_states, None)

@@ -394,6 +394,18 @@ def quantize_linear_layers_to_int8(
         )
 
 
+def _fuse_wan_self_attention_qkv(module: torch.nn.Module) -> None:
+    """With XFUSER_WAN_FUSE_QKV=1, give a Wan self-attention one Q/K/V projection."""
+    from diffusers.models.transformers.transformer_wan import WanAttention
+
+    if os.environ.get("XFUSER_WAN_FUSE_QKV") != "1":
+        return
+    if not isinstance(module, WanAttention) or module.is_cross_attention:
+        return
+    module.fuse_projections()
+    del module.to_q, module.to_k, module.to_v
+
+
 def quantize_linear_layers_to_aiter_int8(
     model: torch.nn.Module,
     parent_name: str = "",
@@ -407,6 +419,7 @@ def quantize_linear_layers_to_aiter_int8(
         xFuserAiterInt8Linear,
     )
 
+    _fuse_wan_self_attention_qkv(model)
     replaced = 0
     for name, module in list(model.named_children()):
         full_name = f"{parent_name}.{name}" if parent_name else name
