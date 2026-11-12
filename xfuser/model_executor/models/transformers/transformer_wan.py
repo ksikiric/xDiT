@@ -267,7 +267,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             if hadamard_placement == "epilogue":
                 query = wan_flydsl_hadamard(query)
                 key = wan_flydsl_hadamard(key)
-            value = value.unflatten(2, (attn.heads, -1))
+            # A fused Q/K/V projection leaves V a strided slice; the input hop reads whole rows.
+            value = value.unflatten(2, (attn.heads, -1)).contiguous()
 
         output = self.attention_function(
             query.transpose(1, 2),
