@@ -8,6 +8,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 from xfuser.model_executor.layers.usp import (
     USP,
+    _ft_c_output_all_to_all,
     attention,
     usp_fused_a2a_input_k,
     usp_fused_a2a_input_q,
@@ -17,6 +18,7 @@ from xfuser.core.distributed.attention_a2a import (
     fused_a2a_pad_multiple,
     get_fused_a2a_hadamard_placement,
     get_fused_a2a_mode,
+    get_fused_a2a_profile,
     use_fused_a2a_interleave,
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
@@ -39,6 +41,7 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     _HAS_FLYDSL,
 )
 from xfuser.model_executor.layers import usp_sdma
+from xfuser.model_executor.layers.monokernel_wan import MONOKERNEL, monokernel_columns
 from xfuser.model_executor.layers.aiter_int8_linear import (
     EPILOGUE_PREP,
     quantize_shared_input,
@@ -218,6 +221,36 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         valid_kv_len = self.attention_kwargs.get("valid_kv_len")
         pending = None
         interleave = use_fused_a2a_interleave() and not attn.fused_projections
+
+        if (
+            MONOKERNEL
+            and attn.fused_projections
+            and isinstance(attn.to_qkv, xFuserAiterInt8Linear)
+            and hadamard_placement == "preprocess"
+        ):
+            # One launch: the fused Q/K/V projection with the Q/K prep, the amax exchange,
+            # E4M3 and the SDMA input hop; then the packed MHA.
+            qkv = attn.to_qkv
+            x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(
+                hidden_states.reshape(-1, qkv.in_features).contiguous()
+            )
+            head_dim = qkv.out_features // (3 * attn.heads)
+            cos_pairs, sin_pairs = rope_pairs(rotary_emb[0], rotary_emb[1], head_dim)
+            eps = attn.norm_q.eps if attn.norm_q.eps is not None else torch.finfo(torch.float32).eps
+            output = torch.ops.xfuser.wan_monokernel_attention(
+                x_quantized,
+                x_scale,
+                qkv.weight_int8,
+                monokernel_columns(attn),
+                cos_pairs,
+                sin_pairs,
+                attn.heads,
+                eps,
+                valid_kv_len,
+                get_fused_a2a_profile(),
+            )
+            output = _ft_c_output_all_to_all(output.transpose(1, 2)).transpose(1, 2)
+            return self._finish_attention(attn, output, activation_dtype)
 
         epilogue_prep = (
             interleave
