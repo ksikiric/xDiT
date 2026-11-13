@@ -17,6 +17,9 @@ from typing import Optional
 import torch
 
 MONOKERNEL = os.environ.get("XFUSER_MONOKERNEL") == "1"
+# Attention A2A profiles whose packed MHA inputs the monokernel produces; other profiles take
+# the ordinary Attention A2A path.
+MONOKERNEL_PROFILES = ("e4m3-e4m3",)
 _SCRIPTS = os.environ.get("XFUSER_MONOKERNEL_SCRIPTS", "/workspace/monokernel-study/scripts")
 HEAD_DIM = 128
 _STATE = {}

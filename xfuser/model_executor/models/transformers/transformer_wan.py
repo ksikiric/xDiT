@@ -41,7 +41,7 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     _HAS_FLYDSL,
 )
 from xfuser.model_executor.layers import usp_sdma
-from xfuser.model_executor.layers.monokernel_wan import MONOKERNEL
+from xfuser.model_executor.layers.monokernel_wan import MONOKERNEL, MONOKERNEL_PROFILES
 from xfuser.model_executor.layers.aiter_int8_linear import (
     EPILOGUE_PREP,
     quantize_shared_input,
@@ -227,6 +227,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             and attn.fused_projections
             and isinstance(attn.to_qkv, xFuserAiterInt8Linear)
             and hadamard_placement == "preprocess"
+            and get_fused_a2a_profile() in MONOKERNEL_PROFILES
         ):
             # One launch: the fused Q/K/V projection with the Q/K prep, the amax exchange,
             # E4M3 and the SDMA input hop; then the packed MHA.
