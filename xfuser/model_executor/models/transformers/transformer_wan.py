@@ -41,7 +41,7 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     _HAS_FLYDSL,
 )
 from xfuser.model_executor.layers import usp_sdma
-from xfuser.model_executor.layers.monokernel_wan import MONOKERNEL, monokernel_columns
+from xfuser.model_executor.layers.monokernel_wan import MONOKERNEL
 from xfuser.model_executor.layers.aiter_int8_linear import (
     EPILOGUE_PREP,
     quantize_shared_input,
@@ -234,14 +234,19 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(
                 hidden_states.reshape(-1, qkv.in_features).contiguous()
             )
-            head_dim = qkv.out_features // (3 * attn.heads)
-            cos_pairs, sin_pairs = rope_pairs(rotary_emb[0], rotary_emb[1], head_dim)
+            pairs = self.attention_kwargs.get("rope_pairs")
+            if pairs is None:
+                pairs = rope_pairs(rotary_emb[0], rotary_emb[1], qkv.out_features // (3 * attn.heads))
+            cos_pairs, sin_pairs = pairs
             eps = attn.norm_q.eps if attn.norm_q.eps is not None else torch.finfo(torch.float32).eps
             output = torch.ops.xfuser.wan_monokernel_attention(
                 x_quantized,
                 x_scale,
                 qkv.weight_int8,
-                monokernel_columns(attn),
+                qkv.weight_scale,
+                qkv.bias,
+                attn.norm_q.weight,
+                attn.norm_k.weight,
                 cos_pairs,
                 sin_pairs,
                 attn.heads,
@@ -578,6 +583,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         # carries no SP pad.
         self._self_attn_kwargs = attention_kwargs if attention_kwargs is not None else {}
         self._self_attn_kwargs.setdefault("valid_kv_len", None)
+        # The monokernel's RoPE pair tables, set per forward with XFUSER_MONOKERNEL.
+        self._self_attn_kwargs.setdefault("rope_pairs", None)
         for block in self.blocks:
             block.attn1.processor = xFuserWanAttnProcessor(attention_kwargs=self._self_attn_kwargs)
             block.attn2.processor = xFuserWanAttnProcessor(
@@ -727,6 +734,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         freqs_cos = get_rotary_emb_chunk(freqs_cos, pad_amount)
         freqs_sin = get_rotary_emb_chunk(freqs_sin, pad_amount)
         rotary_emb = (freqs_cos, freqs_sin)
+        if MONOKERNEL:
+            # Every block's monokernel reads the same tables: build them once per forward.
+            self._self_attn_kwargs["rope_pairs"] = rope_pairs(freqs_cos, freqs_sin, self.config.attention_head_dim)
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
