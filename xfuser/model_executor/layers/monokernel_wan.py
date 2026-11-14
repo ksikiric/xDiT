@@ -138,10 +138,6 @@ def wan_monokernel_attention(
         (query, key, value), scales = packed_output_views(
             tuple(mono.payload(role) for role in range(3)), tuple(mono.scale(role) for role in range(3)), shape,
             codecs, valid_kv_len=direct)
-        if codecs[2] == "e4m3_pc":
-            # The MHA rereads V's per-channel descales for every K/V block; from the uncached
-            # window that made aiter_f6f8 26% slower.
-            scales = (scales[0], scales[1], scales[2].clone())
     else:
         query, key, value = (mono.received(role).view(shape) for role in range(3))
         scales = tuple(mono.scale(role) for role in range(3))
