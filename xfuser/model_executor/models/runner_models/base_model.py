@@ -1212,10 +1212,13 @@ class xFuserModel(abc.ABC):
                 log(f"Captured {len(capture.calls)} PipeFusion stage signature(s).", log_from_all_processes=True)
                 self._reset_pipefusion_compile_state(stages)
 
-        if os.environ.get("XFUSER_INDUCTOR_NO_BUFFER_REUSE") == "1":
-            # Local study switch: with buffer reuse, Wan with Attention A2A on the AITER INT8 GEMMs
-            # gives different videos from run to run.
-            torch._inductor.config.allow_buffer_reuse = False
+        if os.environ.get("XFUSER_INDUCTOR_AUTOTUNE_REDUCTIONS") != "1":
+            # Inductor benchmarks the RBLOCK candidates of a reduction at its first launch, and does
+            # not cache the choice when dynamic RBLOCK scaling added the candidate. Each process can
+            # then pick a different RBLOCK, so LayerNorms sum in a different order and videos differ
+            # from run to run. One heuristic config per reduction keeps runs bit-identical.
+            torch._inductor.config.test_configs.force_filter_reduction_configs = True
+            torch._inductor.config.dynamic_scale_rblock = False
         for name, module in components.items():
             kwargs = compile_kwargs
             if usp_sdma.uses_sdma() and name in self.settings.transformer_attr_names:
