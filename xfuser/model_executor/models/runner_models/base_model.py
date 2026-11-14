@@ -1212,6 +1212,10 @@ class xFuserModel(abc.ABC):
                 log(f"Captured {len(capture.calls)} PipeFusion stage signature(s).", log_from_all_processes=True)
                 self._reset_pipefusion_compile_state(stages)
 
+        if os.environ.get("XFUSER_INDUCTOR_NO_BUFFER_REUSE") == "1":
+            # Local study switch: with buffer reuse, Wan with Attention A2A on the AITER INT8 GEMMs
+            # gives different videos from run to run.
+            torch._inductor.config.allow_buffer_reuse = False
         for name, module in components.items():
             kwargs = compile_kwargs
             if usp_sdma.uses_sdma() and name in self.settings.transformer_attr_names:
