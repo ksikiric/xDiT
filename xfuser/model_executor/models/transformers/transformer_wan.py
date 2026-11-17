@@ -41,7 +41,7 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     _HAS_FLYDSL,
 )
 from xfuser.model_executor.layers import usp_sdma
-from xfuser.model_executor.layers.monokernel_wan import MONOKERNEL, MONOKERNEL_HADAMARD, MONOKERNEL_PROFILES
+from xfuser.model_executor.layers.monokernel import MONOKERNEL, MONOKERNEL_HADAMARD, MONOKERNEL_PROFILES
 from xfuser.model_executor.layers.aiter_int8_linear import (
     EPILOGUE_PREP,
     quantize_shared_input,
@@ -240,7 +240,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 pairs = rope_pairs(rotary_emb[0], rotary_emb[1], qkv.out_features // (3 * attn.heads))
             cos_pairs, sin_pairs = pairs
             eps = attn.norm_q.eps if attn.norm_q.eps is not None else torch.finfo(torch.float32).eps
-            output = torch.ops.xfuser.wan_monokernel_attention(
+            # Wan's prep: RMSNorm across all heads, interleaved RoPE, the projection's bias
+            # and the profile's Q/K Hadamard.
+            output = torch.ops.xfuser.monokernel_attention(
                 x_quantized,
                 x_scale,
                 qkv.weight_int8,
@@ -251,6 +253,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 cos_pairs,
                 sin_pairs,
                 attn.heads,
+                "rms_across_heads",
+                "interleaved",
+                hadamard_placement == "preprocess",
                 eps,
                 valid_kv_len,
                 get_fused_a2a_profile(),
