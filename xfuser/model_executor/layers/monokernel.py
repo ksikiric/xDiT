@@ -1,9 +1,10 @@
 """Self-attention input through AITER's pre-attention monokernel.
 
-With a fused AITER INT8 Q/K/V projection and Attention A2A active, one persistent launch per
-call runs the projection with the model's Q/K prep, quantizes into the Attention A2A profile
-and sends the Ulysses all-to-all from inside the kernel (``PreAttentionMonokernel``). The
-packed MHA then reads the received buffers as it reads Attention A2A's.
+With a fused AITER INT8 or MXFP6 Q/K/V projection and Attention A2A active, one persistent
+launch per call runs the projection with the model's Q/K prep, quantizes into the Attention
+A2A profile and sends the Ulysses all-to-all from inside the kernel
+(``PreAttentionMonokernel``, on its INT8 or A6W6 host GEMM). The packed MHA then reads the
+received buffers as it reads Attention A2A's.
 
 A model supplies its prep (norm, RoPE, Hadamard), its projection's bias and Q/K norm weights,
 and per-token RoPE tables [rows, 64]. XFUSER_MONOKERNEL=1 enables it.
@@ -12,6 +13,10 @@ import os
 from typing import Optional
 
 import torch
+
+from xfuser.logger import init_logger
+
+logger = init_logger(__name__)
 
 MONOKERNEL = os.environ.get("XFUSER_MONOKERNEL", "") in ("1", "2")
 # Q/K Hadamard placements the GEMM epilogue reproduces; others take the Attention A2A path.
@@ -41,8 +46,8 @@ def monokernel_rows_multiple(profile: str) -> int:
     return TILE_TOKENS if k in ("mxfp4", "mxfp6") or v in ("mxfp4", "mxfp6_p") else 1
 
 
-def _session(rows, in_features, heads, prep, eps, profile, valid_kv_len):
-    key = (rows, in_features, heads, prep, eps, profile, valid_kv_len)
+def _session(rows, in_features, heads, prep, eps, profile, valid_kv_len, gemm):
+    key = (rows, in_features, heads, prep, eps, profile, valid_kv_len, gemm)
     session = _SESSIONS.get(key)
     if session is None:
         from aiter.ops.flydsl.pre_attention_monokernel import PreAttentionMonokernel
@@ -61,21 +66,29 @@ def _session(rows, in_features, heads, prep, eps, profile, valid_kv_len):
             prep=prep,
             valid_kv_len=valid_kv_len,
             eps=eps,
+            gemm=gemm,
         )
         _SESSIONS[key] = session
+        logger.info(
+            "monokernel session: %s host, %d rows per rank, %d heads, K %d, profile %s, %s",
+            gemm, rows, heads, in_features, profile, prep,
+        )
     return session
 
 
-def _columns(weight_scale, bias, norm_q_weight, norm_k_weight, heads, hadamard):
-    """Per column of the fused Q/K/V weight: scales, biases, then the norm weights times
-    128 ** -0.5 for the epilogue's Hadamard (ones for V). A per-head norm weight [128] is
-    repeated over the heads. The parameters live as long as the model, so their addresses
-    name the module."""
+def _columns(weight_scale, bias, norm_q_weight, norm_k_weight, heads, hadamard, gemm):
+    """Per column of the fused Q/K/V weight: scales (INT8; ones for the A6W6 host, whose
+    MFMA applies the block scales), biases, then the norm weights times 128 ** -0.5 for the
+    epilogue's Hadamard (ones for V). A per-head norm weight [128] is repeated over the
+    heads. The parameters live as long as the model, so their addresses name the module."""
     tensors = (weight_scale, bias, norm_q_weight, norm_k_weight)
-    key = tuple(None if t is None else t.data_ptr() for t in tensors) + (hadamard,)
+    key = tuple(None if t is None else t.data_ptr() for t in tensors) + (hadamard, gemm)
     columns = _COLUMNS.get(key)
     if columns is None:
-        parts = [weight_scale.float().reshape(-1)]
+        if gemm == "a6w6":
+            parts = [torch.ones(3 * heads * HEAD_DIM, device=weight_scale.device)]
+        else:
+            parts = [weight_scale.float().reshape(-1)]
         if bias is not None:
             parts.append(bias.float().reshape(-1))
         if norm_q_weight is not None:
@@ -109,11 +122,17 @@ def monokernel_attention(
     eps: float,
     valid_kv_len: Optional[int],
     profile: str,
+    rows: int,
+    in_features: int,
+    gemm: str,
 ) -> torch.Tensor:
     """The monokernel, then the packed MHA: [1, S_global, heads / world, 128] BF16.
 
     ``norm``: "rms_across_heads", "rms_per_head" or "none"; ``rope``: "interleaved",
-    "rotate_half" or "none" (see AITER's PrepSpec).
+    "rotate_half" or "none" (see AITER's PrepSpec). ``gemm``: "int8" takes INT8 activations
+    with their row scales and the INT8 weight with its column scales; "a6w6" takes the
+    activations as ``xfuser::mxfp6_quantize`` packs them and the weight packed in the A6W6
+    host's row order (``xFuserMXFP6Linear.weight_packed_host``, ``weight_scale_host``).
     """
     from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import PrepSpec
 
@@ -124,7 +143,6 @@ def monokernel_attention(
     from xfuser.core.distributed import attention_a2a, get_ulysses_parallel_world_size
     from xfuser.core.distributed.attention_a2a import get_fused_a2a_codecs, launch_attention_a2a_packed
 
-    rows, in_features = x_quantized.shape
     world = get_ulysses_parallel_world_size()
     codecs = get_fused_a2a_codecs()
     prep = PrepSpec(norm=norm, rope=rope, bias=bias is not None, hadamard=hadamard)
@@ -132,8 +150,8 @@ def monokernel_attention(
     direct = attention_a2a._select_direct_valid_kv_len(
         attention_a2a._ATTENTION_A2A_CONFIG, valid_kv_len, rows, world
     )
-    session = _session(rows, in_features, heads, prep, eps, profile, direct)
-    columns = _columns(weight_scale, bias, norm_q_weight, norm_k_weight, heads, hadamard)
+    session = _session(rows, in_features, heads, prep, eps, profile, direct, gemm)
+    columns = _columns(weight_scale, bias, norm_q_weight, norm_k_weight, heads, hadamard, gemm)
     results = session(
         x_quantized,
         x_scale.reshape(-1),
@@ -141,6 +159,7 @@ def monokernel_attention(
         columns,
         None if cos_pairs is None else cos_pairs.reshape(-1),
         None if sin_pairs is None else sin_pairs.reshape(-1),
+        weight_scale=weight_scale if gemm == "a6w6" else None,
     )
     shape = (1, world * rows, heads // world, HEAD_DIM)
     (query, key, value), scales = packed_output_views(
@@ -156,8 +175,8 @@ def monokernel_attention(
 
 @monokernel_attention.register_fake
 def _(x_quantized, x_scale, weight, weight_scale, bias, norm_q_weight, norm_k_weight, cos_pairs, sin_pairs, heads,
-      norm, rope, hadamard, eps, valid_kv_len, profile):
+      norm, rope, hadamard, eps, valid_kv_len, profile, rows, in_features, gemm):
     from xfuser.core.distributed import get_ulysses_parallel_world_size
 
     world = get_ulysses_parallel_world_size()
-    return x_quantized.new_empty((1, world * x_quantized.shape[0], heads // world, HEAD_DIM), dtype=torch.bfloat16)
+    return x_quantized.new_empty((1, world * rows, heads // world, HEAD_DIM), dtype=torch.bfloat16)

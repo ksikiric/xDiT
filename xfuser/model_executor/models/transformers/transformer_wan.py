@@ -42,6 +42,7 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
 )
 from xfuser.model_executor.layers import usp_sdma
 from xfuser.model_executor.layers.monokernel import MONOKERNEL, MONOKERNEL_HADAMARD, MONOKERNEL_PROFILES
+from xfuser.model_executor.layers.mxfp6_linear import xFuserMXFP6Linear
 from xfuser.model_executor.layers.aiter_int8_linear import (
     EPILOGUE_PREP,
     quantize_shared_input,
@@ -222,19 +223,28 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         pending = None
         interleave = use_fused_a2a_interleave() and not attn.fused_projections
 
+        qkv = getattr(attn, "to_qkv", None)
+        mono_gemm = None
+        if isinstance(qkv, xFuserAiterInt8Linear):
+            mono_gemm = "int8"
+        elif isinstance(qkv, xFuserMXFP6Linear) and hasattr(qkv, "weight_packed_host"):
+            mono_gemm = "a6w6"
         if (
             MONOKERNEL
             and attn.fused_projections
-            and isinstance(attn.to_qkv, xFuserAiterInt8Linear)
+            and mono_gemm is not None
             and hadamard_placement in MONOKERNEL_HADAMARD
             and get_fused_a2a_profile() in MONOKERNEL_PROFILES
         ):
             # One launch: the fused Q/K/V projection with the Q/K prep, the scale exchange,
             # the profile's quantization and the SDMA input hop; then the packed MHA.
-            qkv = attn.to_qkv
-            x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(
-                hidden_states.reshape(-1, qkv.in_features).contiguous()
-            )
+            x_2d = hidden_states.reshape(-1, qkv.in_features).contiguous()
+            if mono_gemm == "a6w6":
+                x_quantized, x_scale = torch.ops.xfuser.mxfp6_quantize(x_2d)
+                weight, weight_scale = qkv.weight_packed_host, qkv.weight_scale_host
+            else:
+                x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(x_2d)
+                weight, weight_scale = qkv.weight_int8, qkv.weight_scale
             pairs = self.attention_kwargs.get("rope_pairs")
             if pairs is None:
                 pairs = rope_pairs(rotary_emb[0], rotary_emb[1], qkv.out_features // (3 * attn.heads))
@@ -245,8 +255,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             output = torch.ops.xfuser.monokernel_attention(
                 x_quantized,
                 x_scale,
-                qkv.weight_int8,
-                qkv.weight_scale,
+                weight,
+                weight_scale,
                 qkv.bias,
                 attn.norm_q.weight,
                 attn.norm_k.weight,
@@ -259,6 +269,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 eps,
                 valid_kv_len,
                 get_fused_a2a_profile(),
+                x_2d.shape[0],
+                qkv.in_features,
+                mono_gemm,
             )
             output = _ft_c_output_all_to_all(output.transpose(1, 2)).transpose(1, 2)
             return self._finish_attention(attn, output, activation_dtype)

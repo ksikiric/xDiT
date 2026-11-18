@@ -605,11 +605,15 @@ def quantize_linear_layers_to_fp6(
     The source module remains fully intact until the packed replacement is
     installed. ``device`` is the transient packing/final device;
     ``offload_to_cpu`` evicts each converted leaf immediately after packing.
-    Returns the number of leaves replaced.
+    Returns the number of leaves replaced. With XFUSER_FUSE_QKV=1 a self-attention's
+    Q/K/V projections are fused first, and with the monokernel on the fused projection is
+    also packed for its A6W6 host.
     """
 
+    from xfuser.model_executor.layers.monokernel import MONOKERNEL
     from xfuser.model_executor.layers.mxfp6_linear import xFuserMXFP6Linear
 
+    _fuse_self_attention_qkv(model)
     replaced = 0
     for name, module in list(model.named_children()):
         full_name = f"{parent_name}.{name}" if parent_name else name
@@ -625,6 +629,7 @@ def quantize_linear_layers_to_fp6(
                 bias=module.bias is not None,
                 device="meta",
                 dtype=weight.dtype,
+                host_layout=MONOKERNEL and name == "to_qkv" and module.out_features % 384 == 0,
             )
             fp6_layer.train(module.training)
             fp6_layer.load_and_quantize_weights(weight, bias, device=device)

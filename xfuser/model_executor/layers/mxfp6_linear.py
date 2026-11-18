@@ -53,8 +53,29 @@ def _(
     )
 
 
+@torch.library.custom_op("xfuser::mxfp6_quantize", mutates_args=())
+def mxfp6_quantize(input_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The activations as the A6W6 GEMMs take them: packed codes and E8M0 scales."""
+    return quant_mxfp6_gemm(input_2d)
+
+
+@mxfp6_quantize.register_fake
+def _(input_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    packed, scale = mxfp6_gemm_pack_size(input_2d.shape[0], input_2d.shape[1])
+    return (
+        input_2d.new_empty(packed, dtype=torch.uint8),
+        input_2d.new_empty(scale, dtype=torch.uint8),
+    )
+
+
 class xFuserMXFP6Linear(nn.Module):
-    """Drop-in BF16 linear using AITER's MXFP6 A6W6 GEMM."""
+    """Drop-in BF16 linear using AITER's MXFP6 A6W6 GEMM.
+
+    ``host_layout`` also packs the weight's rows in the order AITER's A6W6 monokernel host
+    takes them (``weight_packed_host``, ``weight_scale_host``), for a fused Q/K/V
+    projection the pre-attention monokernel runs. It needs the full-precision weight, so
+    it is packed when the weight is quantized.
+    """
 
     def __init__(
         self,
@@ -63,6 +84,7 @@ class xFuserMXFP6Linear(nn.Module):
         bias: bool = True,
         device=None,
         dtype=None,
+        host_layout: bool = False,
     ) -> None:
         super().__init__()
         dtype = torch.bfloat16 if dtype is None else dtype
@@ -71,6 +93,7 @@ class xFuserMXFP6Linear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
+        self.host_layout = host_layout
         factory_kwargs = {"device": device, "dtype": dtype}
         self.weight = nn.Parameter(
             torch.empty((out_features, in_features), **factory_kwargs)
@@ -101,10 +124,9 @@ class xFuserMXFP6Linear(nn.Module):
         return incoming.device if current.device.type == "meta" else current.device
 
     def _remove_packed_state(self) -> None:
-        if hasattr(self, "weight_packed"):
-            delattr(self, "weight_packed")
-        if hasattr(self, "weight_scale"):
-            delattr(self, "weight_scale")
+        for name in ("weight_packed", "weight_scale", "weight_packed_host", "weight_scale_host"):
+            if hasattr(self, name):
+                delattr(self, name)
 
     def _install_packed_state(
         self,
@@ -163,8 +185,17 @@ class xFuserMXFP6Linear(nn.Module):
             raise RuntimeError("MXFP6 full-precision weight is unavailable")
         if self._is_fsdp_managed_parameter(self.weight):
             raise RuntimeError("Quantize MXFP6 weights before fully_shard")
+        host = None
+        if self.host_layout:
+            from aiter.ops.flydsl.kernels.gemm_a6w6_4wave_host import host_weight_order
+
+            order = host_weight_order(self.out_features).to(self.weight.device)
+            host = quant_mxfp6_gemm(self.weight.detach()[order].contiguous())
         weight_packed, weight_scale = quant_mxfp6_gemm(self.weight)
         self._install_packed_state(weight_packed, weight_scale)
+        if host is not None:
+            self.register_buffer("weight_packed_host", host[0], persistent=False)
+            self.register_buffer("weight_scale_host", host[1], persistent=False)
 
     def _load_from_state_dict(
         self,

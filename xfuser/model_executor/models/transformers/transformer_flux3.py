@@ -190,6 +190,9 @@ class xFuserFlux3AttnProcessor:
             eps,
             self.valid_kv_len,
             get_fused_a2a_profile(),
+            x_quantized.shape[0],
+            x_quantized.shape[1],
+            "int8",
         )
         return _ft_c_output_all_to_all(output.transpose(1, 2))
 
