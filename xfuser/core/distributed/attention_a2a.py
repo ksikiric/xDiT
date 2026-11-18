@@ -860,7 +860,12 @@ def _init_mori(group, ranks):
     # non-members need not participate in subgroup creation.
     _MORI_CPU_GROUP = dist.new_group(ranks=list(ranks), backend="gloo", use_local_synchronization=True)
     torch._C._distributed_c10d._register_process_group("mori", _MORI_CPU_GROUP)
-    ms.shmem_torch_process_group_init("mori")
+    # ms.shmem_torch_process_group_init broadcasts the unique id from global rank 0, which
+    # the Ulysses groups of the second CFG-parallel half do not hold.
+    rank = dist.get_rank(_MORI_CPU_GROUP)
+    unique_id = [ms.shmem_get_unique_id() if rank == 0 else None]
+    dist.broadcast_object_list(unique_id, src=dist.get_global_rank(_MORI_CPU_GROUP, 0), group=_MORI_CPU_GROUP)
+    ms.shmem_init_attr(ms.MORI_SHMEM_INIT_WITH_UNIQUEID, rank, dist.get_world_size(_MORI_CPU_GROUP), unique_id[0])
     _MORI_GROUP_KEY = group_key
 
 
