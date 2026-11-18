@@ -23,8 +23,22 @@ try:
 except ImportError:
     MONOKERNEL_PROFILES = ()
 HEAD_DIM = 128
+# Ranks own whole 128-token tiles of the tiled K/V layouts (MXFP4 and MXFP6 K, MXFP4 and
+# packed MXFP6 V).
+TILE_TOKENS = 128
+# The session's call counter is host state, so Inductor runs the op between CUDA graph
+# partitions instead of capturing it.
+_HOST_STATE = (torch.Tag.cudagraph_unsafe,) if hasattr(torch.Tag, "cudagraph_unsafe") else ()
 _SESSIONS = {}
 _COLUMNS = {}
+
+
+def monokernel_rows_multiple(profile: str) -> int:
+    """Rows per rank the profile's monokernel layouts need."""
+    from aiter.ops.flydsl.attention_a2a_profiles import attention_a2a_profile
+
+    _, k, v = attention_a2a_profile(profile).codecs
+    return TILE_TOKENS if k in ("mxfp4", "mxfp6") or v in ("mxfp4", "mxfp6_p") else 1
 
 
 def _session(rows, in_features, heads, prep, eps, profile, valid_kv_len):
@@ -77,7 +91,7 @@ def _columns(weight_scale, bias, norm_q_weight, norm_k_weight, heads, hadamard):
     return columns
 
 
-@torch.library.custom_op("xfuser::monokernel_attention", mutates_args=())
+@torch.library.custom_op("xfuser::monokernel_attention", mutates_args=(), tags=_HOST_STATE)
 def monokernel_attention(
     x_quantized: torch.Tensor,
     x_scale: torch.Tensor,

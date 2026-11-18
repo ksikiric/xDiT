@@ -1,4 +1,5 @@
 import functools
+import math
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -12,16 +13,62 @@ from diffusers.models.transformers.transformer_flux3 import (
 )
 
 from xfuser.core.distributed import (
+    get_ring_parallel_world_size,
+    get_runtime_state,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
+from xfuser.core.distributed.attention_a2a import (
+    fused_a2a_pad_multiple,
+    get_fused_a2a_hadamard_placement,
+    get_fused_a2a_mode,
+    get_fused_a2a_profile,
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.model_executor.layers import usp_sdma
-from xfuser.model_executor.layers.usp import PROCESS_GROUP, USP, attention
+from xfuser.model_executor.layers.aiter_int8_linear import (
+    quantize_shared_input,
+    rope_pairs,
+    xFuserAiterInt8Linear,
+)
+from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import wan_flydsl_hadamard
+from xfuser.model_executor.layers.monokernel import (
+    MONOKERNEL,
+    MONOKERNEL_HADAMARD,
+    MONOKERNEL_PROFILES,
+    monokernel_rows_multiple,
+)
+from xfuser.model_executor.layers.usp import PROCESS_GROUP, USP, _ft_c_output_all_to_all, attention
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
     gather_and_unpad,
 )
+
+
+def _attention_a2a_active() -> bool:
+    """Whether sharded stages send Q/K/V through the Attention A2A input hop."""
+    return (
+        get_fused_a2a_mode() > 0
+        and get_ulysses_parallel_world_size() > 1
+        and get_ring_parallel_world_size() == 1
+        and not get_runtime_state().runtime_config.use_sparseattn_head_balance
+    )
+
+
+def _sp_pad(seq_len: int, sp_world_size: int) -> int:
+    """Rows that pad a sharded stage to equal chunks, which the Attention A2A layouts
+    (and the monokernel's tiled K/V layouts) need in whole row tiles per rank."""
+    multiple = sp_world_size
+    if _attention_a2a_active():
+        multiple = fused_a2a_pad_multiple(sp_world_size)
+        if MONOKERNEL:
+            multiple = math.lcm(multiple, sp_world_size * monokernel_rows_multiple(get_fused_a2a_profile()))
+    return (multiple - seq_len % multiple) % multiple
+
+
+def _project(linear, hidden_states, shared):
+    return linear(hidden_states) if shared is None else linear(hidden_states, quantized=shared)
 
 
 class xFuserFlux3AttnProcessor:
@@ -32,11 +79,17 @@ class xFuserFlux3AttnProcessor:
     ``valid_kv_len`` to the stage's real length when the SP pad made the sequence
     longer, so the pad keys are dropped after the all-to-all, and ``local`` when
     every rank holds the whole stream, so attention runs without collectives.
+
+    With Attention A2A active, sharded stages send Q/K/V through its quantized input hop.
+    With XFUSER_MONOKERNEL=1 and a fused AITER INT8 Q/K/V projection, AITER's pre-attention
+    monokernel runs the projection, the Q/K prep and the hop in one launch; the transformer
+    then also sets ``rope_pairs``, the stage's RoPE tables per rotation pair.
     """
 
     def __init__(self):
         self.valid_kv_len: Optional[int] = None
         self.local = False
+        self.rope_pairs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def __call__(
         self,
@@ -48,31 +101,97 @@ class xFuserFlux3AttnProcessor:
         if attention_mask is not None:
             raise NotImplementedError("FLUX.3 attention takes no mask.")
 
-        query, key, value = _get_qkv_projections(attn, hidden_states)
-
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
-        query, key, value = self._norm_rope(attn, query, key, value, image_rotary_emb)
-
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-
-        if self.local:
-            hidden_states = attention(query, key, value)
+        activation_dtype = hidden_states.dtype
+        attention_a2a = not self.local and _attention_a2a_active()
+        if attention_a2a and image_rotary_emb is not None and self._monokernel_eligible(attn):
+            hidden_states = self._monokernel(attn, hidden_states, image_rotary_emb)
         else:
-            attention_kwargs = None if self.valid_kv_len is None else {"valid_kv_len": self.valid_kv_len}
-            hidden_states = USP(
-                query, key, value, attn_layer=attn, attention_kwargs=attention_kwargs, combine_qkv_a2a=True
-            )
+            query, key, value = self._projections(attn, hidden_states)
+
+            query = query.unflatten(-1, (attn.heads, -1))
+            key = key.unflatten(-1, (attn.heads, -1))
+            value = value.unflatten(-1, (attn.heads, -1))
+            query, key, value = self._norm_rope(attn, query, key, value, image_rotary_emb)
+            if attention_a2a:
+                if get_fused_a2a_hadamard_placement() != "none":
+                    query = wan_flydsl_hadamard(query)
+                    key = wan_flydsl_hadamard(key)
+                # A fused Q/K/V projection leaves V a strided slice; the input hop reads whole rows.
+                value = value.contiguous()
+
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+
+            if self.local:
+                hidden_states = attention(query, key, value)
+            else:
+                attention_kwargs = None if self.valid_kv_len is None else {"valid_kv_len": self.valid_kv_len}
+                hidden_states = USP(
+                    query,
+                    key,
+                    value,
+                    attn_layer=attn,
+                    attention_kwargs=attention_kwargs,
+                    combine_qkv_a2a=True,
+                    attention_a2a_enabled=attention_a2a,
+                )
 
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = hidden_states.to(activation_dtype)
 
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
+
+    @staticmethod
+    def _projections(attn, hidden_states):
+        if attn.fused_projections:
+            return _get_qkv_projections(attn, hidden_states)
+        linears = (attn.to_q, attn.to_k, attn.to_v)
+        shared = quantize_shared_input(linears, hidden_states)
+        return tuple(_project(linear, hidden_states, shared) for linear in linears)
+
+    @staticmethod
+    def _monokernel_eligible(attn) -> bool:
+        return (
+            MONOKERNEL
+            and attn.fused_projections
+            and isinstance(attn.to_qkv, xFuserAiterInt8Linear)
+            and get_fused_a2a_hadamard_placement() in MONOKERNEL_HADAMARD
+            and get_fused_a2a_profile() in MONOKERNEL_PROFILES
+        )
+
+    def _monokernel(self, attn, hidden_states, image_rotary_emb):
+        """[b, heads, s, d] attention output; FLUX.3's prep is a per-head RMSNorm, interleaved
+        RoPE, no bias and the profile's Q/K Hadamard."""
+        qkv = attn.to_qkv
+        x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(
+            hidden_states.reshape(-1, qkv.in_features).contiguous()
+        )
+        pairs = self.rope_pairs
+        if pairs is None:
+            pairs = rope_pairs(image_rotary_emb[0], image_rotary_emb[1], attn.head_dim)
+        eps = attn.norm_q.eps if attn.norm_q.eps is not None else torch.finfo(torch.float32).eps
+        output = torch.ops.xfuser.monokernel_attention(
+            x_quantized,
+            x_scale,
+            qkv.weight_int8,
+            qkv.weight_scale,
+            None,
+            attn.norm_q.weight,
+            attn.norm_k.weight,
+            pairs[0],
+            pairs[1],
+            attn.heads,
+            "rms_per_head",
+            "interleaved",
+            get_fused_a2a_hadamard_placement() == "preprocess",
+            eps,
+            self.valid_kv_len,
+            get_fused_a2a_profile(),
+        )
+        return _ft_c_output_all_to_all(output.transpose(1, 2))
 
     @staticmethod
     def _norm_rope(attn, query, key, value, image_rotary_emb):
@@ -135,9 +254,9 @@ def flux3_attn_modules(transformer) -> list[torch.nn.Module]:
 class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
     """Sequence-parallel FLUX.3 transformer.
 
-    Every sequence is padded at its end to a multiple of the SP degree and split
-    evenly across ranks, so after the Ulysses all-to-all the pad is a uniform
-    suffix that ``valid_kv_len`` removes:
+    Every sequence is padded at its end to a multiple of the SP degree (of whole row
+    tiles per rank under Attention A2A) and split evenly across ranks, so after the
+    Ulysses all-to-all the pad is a uniform suffix that ``valid_kv_len`` removes:
 
     - Per-mode blocks: the text, image and reference-image streams are attended
       separately. The image and reference streams are sharded, then gathered. A
@@ -189,6 +308,12 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
         rotary_emb = tuple(chunk_and_pad_sequence(r, sp_rank, sp_world_size, pad, dim=0) for r in rotary_emb)
         return hidden_states, temb_mod, rotary_emb
 
+    def _monokernel_rope_pairs(self, rotary_emb: Tuple[torch.Tensor, torch.Tensor]):
+        """A stage's RoPE tables for the monokernel, built once per forward instead of per block."""
+        if not (MONOKERNEL and _attention_a2a_active()):
+            return None
+        return rope_pairs(rotary_emb[0], rotary_emb[1], self.config.attention_head_dim)
+
     def _run_mode_blocks(
         self,
         blocks: torch.nn.ModuleList,
@@ -207,12 +332,13 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
 
         sp_world_size = get_sequence_parallel_world_size()
         seq_len = hidden_states.shape[1]
-        pad = (sp_world_size - seq_len % sp_world_size) % sp_world_size
+        pad = _sp_pad(seq_len, sp_world_size)
         processor.valid_kv_len = seq_len if pad else None
 
         hidden_states, temb_mod, rotary_emb = self._shard(
             get_sequence_parallel_rank(), sp_world_size, pad, hidden_states, temb_mod, rotary_emb
         )
+        processor.rope_pairs = self._monokernel_rope_pairs(rotary_emb)
         for block in blocks:
             hidden_states = block(hidden_states, temb_mod, rotary_emb)
         return gather_and_unpad(hidden_states, pad, dim=1)
@@ -313,11 +439,12 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
 
         sp_rank = get_sequence_parallel_rank()
         sp_world_size = get_sequence_parallel_world_size()
-        pad = (sp_world_size - joint_seq_len % sp_world_size) % sp_world_size
+        pad = _sp_pad(joint_seq_len, sp_world_size)
         self._joint_processor.valid_kv_len = joint_seq_len if pad else None
         joint_states, joint_mod, joint_rotary_emb = self._shard(
             sp_rank, sp_world_size, pad, joint_states, joint_mod, joint_rotary_emb
         )
+        self._joint_processor.rope_pairs = self._monokernel_rope_pairs(joint_rotary_emb)
 
         # Text tokens of this rank's chunk: the leading part, possibly none.
         chunk_len = joint_states.shape[1]

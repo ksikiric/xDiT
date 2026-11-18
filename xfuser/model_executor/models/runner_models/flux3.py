@@ -61,7 +61,10 @@ class _Flux3Model(xFuserModel):
         ring_degree=True,
         use_cfg_parallel=False,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_comms=True,
+        supports_attention_a2a=True,
         fully_shard_degree=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -72,6 +75,11 @@ class _Flux3Model(xFuserModel):
         model_output_type="image",
         mod_value=16,
         fp8_gemm_module_list=[
+            "transformer.txt_mode_blocks",
+            "transformer.mode_blocks",
+            "transformer.single_transformer_blocks",
+        ],
+        int8_gemm_module_list=[
             "transformer.txt_mode_blocks",
             "transformer.mode_blocks",
             "transformer.single_transformer_blocks",
@@ -167,6 +175,10 @@ class _Flux3Model(xFuserModel):
         # A sharded forward is launch-bound: graphs cut a compiled u8 1024² forward on
         # MI350X from 22 to 17 ms. Graphs re-capture pathologically on RDNA4, as for FLUX.2.
         if PACKAGES_CHECKER._on_rdna4():
+            return "default"
+        # Attention A2A's input hop keeps its inputs alive until the transport completes, which
+        # CUDA graph trees refuse for tensors in their pool.
+        if self.config.attention_a2a != "none":
             return "default"
         return "reduce-overhead"
 
