@@ -39,6 +39,7 @@ from xfuser.model_executor.layers.monokernel import (
     MONOKERNEL_PROFILES,
     monokernel_rows_multiple,
 )
+from xfuser.model_executor.layers.mxfp6_linear import xFuserMXFP6Linear
 from xfuser.model_executor.layers.usp import PROCESS_GROUP, USP, _ft_c_output_all_to_all, attention
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
@@ -153,11 +154,21 @@ class xFuserFlux3AttnProcessor:
         return tuple(_project(linear, hidden_states, shared) for linear in linears)
 
     @staticmethod
-    def _monokernel_eligible(attn) -> bool:
+    def _monokernel_gemm(attn) -> Optional[str]:
+        """The monokernel host for this attention's fused Q/K/V projection, or None."""
+        qkv = getattr(attn, "to_qkv", None)
+        if isinstance(qkv, xFuserAiterInt8Linear):
+            return "int8"
+        if isinstance(qkv, xFuserMXFP6Linear) and hasattr(qkv, "weight_packed_host"):
+            return "a6w6"
+        return None
+
+    @classmethod
+    def _monokernel_eligible(cls, attn) -> bool:
         return (
             MONOKERNEL
             and attn.fused_projections
-            and isinstance(attn.to_qkv, xFuserAiterInt8Linear)
+            and cls._monokernel_gemm(attn) is not None
             and get_fused_a2a_hadamard_placement() in MONOKERNEL_HADAMARD
             and get_fused_a2a_profile() in MONOKERNEL_PROFILES
         )
@@ -166,9 +177,14 @@ class xFuserFlux3AttnProcessor:
         """[b, heads, s, d] attention output; FLUX.3's prep is a per-head RMSNorm, interleaved
         RoPE, no bias and the profile's Q/K Hadamard."""
         qkv = attn.to_qkv
-        x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(
-            hidden_states.reshape(-1, qkv.in_features).contiguous()
-        )
+        gemm = self._monokernel_gemm(attn)
+        x_2d = hidden_states.reshape(-1, qkv.in_features).contiguous()
+        if gemm == "a6w6":
+            x_quantized, x_scale = torch.ops.xfuser.mxfp6_quantize(x_2d)
+            weight, weight_scale = qkv.weight_packed_host, qkv.weight_scale_host
+        else:
+            x_quantized, x_scale = torch.ops.xfuser.aiter_int8_quantize_rows(x_2d)
+            weight, weight_scale = qkv.weight_int8, qkv.weight_scale
         pairs = self.rope_pairs
         if pairs is None:
             pairs = rope_pairs(image_rotary_emb[0], image_rotary_emb[1], attn.head_dim)
@@ -176,8 +192,8 @@ class xFuserFlux3AttnProcessor:
         output = torch.ops.xfuser.monokernel_attention(
             x_quantized,
             x_scale,
-            qkv.weight_int8,
-            qkv.weight_scale,
+            weight,
+            weight_scale,
             None,
             attn.norm_q.weight,
             attn.norm_k.weight,
@@ -190,9 +206,9 @@ class xFuserFlux3AttnProcessor:
             eps,
             self.valid_kv_len,
             get_fused_a2a_profile(),
-            x_quantized.shape[0],
-            x_quantized.shape[1],
-            "int8",
+            x_2d.shape[0],
+            qkv.in_features,
+            gemm,
         )
         return _ft_c_output_all_to_all(output.transpose(1, 2))
 

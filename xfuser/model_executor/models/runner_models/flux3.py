@@ -63,6 +63,7 @@ class _Flux3Model(xFuserModel):
         use_fp8_gemms=True,
         use_int8_gemms=True,
         use_aiter_int8_gemms=True,
+        use_fp6_gemms=True,
         use_fp8_comms=True,
         supports_attention_a2a=True,
         fully_shard_degree=True,
